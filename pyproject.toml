@@ -1,6 +1,16 @@
 [project]
 name = "dagster-webhook"
-version = "0.1.0"
-description = "Add your description here"
-requires-python = ">=3.12"
-dependencies = []
+version = "1.0.0"
+description = "A FastAPI-based RPC/Webhook gateway for Dagster GraphQL API with authentication and monitoring endpoints"
+requires-python = ">=3.13"
+dependencies = [
+    "dagster-graphql",
+    "fastapi",
+    "pydantic",
+    "uvicorn",
+]
+[tool.uv]
+environments = [
+    "sys_platform == 'win32'",
+    "sys_platform == 'linux'"
+]
