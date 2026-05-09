@@ -1,10 +1,10 @@
 [project]
 name = "dagster-webhook"
-version = "1.0.0"
+version = "1.13.4.0"
 description = "A FastAPI-based RPC/Webhook gateway for Dagster GraphQL API with authentication and monitoring endpoints"
 requires-python = ">=3.13"
 dependencies = [
-    "dagster==1.13.0",
+    "dagster==1.13.4",
     "dagster-graphql",
     "fastapi",
     "pydantic",
