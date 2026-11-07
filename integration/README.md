@@ -42,6 +42,8 @@ uv pip install --python /tmp/dagster-gateway-acceptance/bin/python . dagster-web
   两处冲突或均未提供返回 422，且不向 Dagster 发送创建请求。
 - 来源与提交关联保留标签在发往上游之前被拒绝。
 - 同 Key 并发提交仅发送一次 launch mutation，运行列表和事件可读取。
+- 查询每个 op 执行步骤的状态及所有输出事件，验证明确导出的 JSON、null、0 和 false
+  值，以及没有导出的值明确标记为不可读取；小页游标遍历完整覆盖输出事件。
 - 网关重启后使用持久化记录返回相同 Run。
 - 代理在 Dagster 确认接受后丢弃 launch 响应，验证 UNKNOWN、submission 查询、
   重启、显式核对和同 Key 重放；代理统计确认没有第二次 launch。

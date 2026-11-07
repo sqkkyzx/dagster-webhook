@@ -11,6 +11,11 @@ from dagster_graphql import DagsterGraphQLClient, DagsterGraphQLClientError
 from fastapi import HTTPException
 
 from gateway.errors import GatewayHTTPError
+from gateway.run_outputs import (
+    OUTPUTS_EVENTS_QUERY,
+    OUTPUTS_RUN_QUERY,
+    collect_run_outputs,
+)
 from gateway.validation import SUBMISSION_TAG, validate_submission_tags
 
 RUN_FIELDS = """
@@ -189,6 +194,8 @@ GRAPHQL_DOCUMENTS = (
     EVENTS_QUERY,
     SUBMIT_MUTATION,
     TERMINATE_MUTATION,
+    OUTPUTS_RUN_QUERY,
+    OUTPUTS_EVENTS_QUERY,
 )
 
 
@@ -569,6 +576,22 @@ class DagsterAdapter:
             "next_cursor": result["cursor"],
             "has_more": result["hasMore"],
         }
+
+    def get_run_outputs(
+        self,
+        run_id: str,
+        *,
+        cursor=None,
+        max_events=10000,
+        value_metadata_key="api_value",
+    ) -> dict:
+        return collect_run_outputs(
+            self._execute,
+            run_id,
+            cursor=cursor,
+            max_events=max_events,
+            value_metadata_key=value_metadata_key,
+        )
 
     def submit_legacy_job(self, payload: dict) -> str:
         """Submit an already resolved legacy selector without an idempotent Run ID."""

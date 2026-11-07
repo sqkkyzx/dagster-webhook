@@ -2,11 +2,18 @@
 
 import datetime
 import json
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from dagster import DagsterRunStatus
 from fastapi import APIRouter, Depends, Path, Query
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    StringConstraints,
+    model_validator,
+)
 
 from gateway.dagster_adapter import DagsterAdapter, build_runs_filter, encode_job_id
 from gateway.errors import GatewayHTTPError, responses
@@ -225,6 +232,205 @@ class EventsResponse(BaseModel):
         description="Dagster 不透明的事件尾部游标；即使 has_more=false 也可用于稍后继续轮询。"
     )
     has_more: bool = Field(description="当前查询时刻是否还有未返回的事件。")
+
+
+class OutputMetadataEntry(BaseModel):
+    label: str = Field(description="Dagster 输出元数据的标签，例如 api_value、path。")
+    type: str = Field(
+        description="Dagster GraphQL 元数据类型名称，例如 JsonMetadataEntry、PathMetadataEntry。"
+    )
+    description: str | None = Field(None, description="元数据项说明。")
+    value: JsonValue = Field(
+        None,
+        description="元数据的 JSON 预览；不支持展开的类型可为空。单项预览最多约 4 KiB，所有预览另共享 1 MiB 预算；不能将普通元数据自动视为 op 实际返回值。预算耗尽时可为空，截断时也可能为字符串预览。",
+    )
+    value_available: bool = Field(
+        description="元数据值是否完整且类型已识别；true/value=null 表示明确的 null。未知类型或预览截断时为 false。此字段不表示 op 实际返回值可读。"
+    )
+    truncated: bool = Field(description="元数据预览是否因大小限制而被截断。")
+
+
+class RunOutputEvent(BaseModel):
+    event_type: Literal["STEP_OUTPUT", "HANDLED_OUTPUT"] = Field(
+        description="STEP_OUTPUT 表示 op 产生输出及类型检查；HANDLED_OUTPUT 表示 IO Manager 已处理输出。两者独立返回，不代表实际值一定可读。"
+    )
+    output_name: str = Field(
+        description="op 声明的输出名称，普通单输出通常为 result。", examples=["result"]
+    )
+    timestamp: datetime.datetime | None = Field(
+        None,
+        description="输出事件的 UTC 时间；本接口统一使用 ISO 8601，与旧 events 接口的原生毫秒字符串不同。",
+    )
+    type_check_success: bool | None = Field(
+        None,
+        description="STEP_OUTPUT 的类型检查结果；HANDLED_OUTPUT 没有该字段时为空。产生输出后步骤仍可能失败。",
+    )
+    manager_key: str | None = Field(
+        None,
+        description="HANDLED_OUTPUT 报告的 IO Manager 资源键；STEP_OUTPUT 通常为空。",
+    )
+    metadata: list[OutputMetadataEntry] = Field(
+        description="该次输出事件的元数据预览；不自动合并其他事件。"
+    )
+    value_available: bool = Field(
+        description="是否从明确约定的结果元数据中读取到实际值；true 且 value=null 表示实际值就是 null。"
+    )
+    value: JsonValue = Field(
+        None,
+        description="读取到的 JSON 实际值，可为对象、数组、字符串、数字、布尔或 null。仅在 value_available=true 时解释为已导出的实际值。",
+    )
+    value_unavailable_reason: (
+        Literal["NOT_EXPOSED", "INVALID_VALUE", "VALUE_TOO_LARGE", "RESPONSE_LIMIT"]
+        | None
+    ) = Field(
+        None,
+        description="不可读取原因：NOT_EXPOSED 为该事件未按约定导出结果；INVALID_VALUE 为类型不支持、不是合法有限 JSON 或嵌套超过 64 层；VALUE_TOO_LARGE 为单值超过 64 KiB；RESPONSE_LIMIT 为本次响应实际值累计超过 1 MiB。可读取时为空。",
+    )
+    value_source: str | None = Field(
+        None, description="用于读取结果的元数据标签，例如 api_value；没有对应项时为空。"
+    )
+
+
+class RunStepAttempt(BaseModel):
+    started_at: datetime.datetime | None = Field(
+        None, description="本次步骤执行尝试开始的 UTC 时间。"
+    )
+    ended_at: datetime.datetime | None = Field(
+        None, description="本次尝试结束的 UTC 时间；尚未结束时为空。"
+    )
+
+
+class RunStepOutputs(BaseModel):
+    step_key: str = Field(
+        description="Run 内的实际执行步骤键。动态映射的各实例可能分别出现，例如 process[a]。",
+        examples=["extract"],
+    )
+    op_handle: str | None = Field(
+        None,
+        description="步骤对应的 op 句柄，包含嵌套图路径；无法从历史计划或事件确定时为空。多个动态实例可共享同一个句柄。",
+    )
+    kind: Literal["COMPUTE", "UNRESOLVED_MAPPED", "UNRESOLVED_COLLECT"] | None = Field(
+        None,
+        description="Dagster 执行计划步骤类型；缺少计划信息时为空。未解析的动态步骤是计划模板，不等同于实际执行实例。",
+    )
+    status: Literal[
+        "SKIPPED", "SUCCESS", "FAILURE", "IN_PROGRESS", "NOT_STARTED", "UNKNOWN"
+    ] = Field(
+        description="Dagster 步骤统计状态；计划中既无统计也无事件的步骤为 NOT_STARTED，已观察到输出却缺少统计或统计状态不确定时为 UNKNOWN。Run 取消不会被直接推断为每个步骤均取消。"
+    )
+    started_at: datetime.datetime | None = Field(
+        None, description="步骤开始的 UTC 时间；未启动或无统计时为空。"
+    )
+    ended_at: datetime.datetime | None = Field(
+        None, description="步骤结束的 UTC 时间；未结束或无统计时为空。"
+    )
+    attempts: list[RunStepAttempt] = Field(
+        description="Dagster 记录的执行尝试，包括重试。输出事件按原始顺序保留，不直接归并或覆盖不同尝试。"
+    )
+    declared_outputs: list[str] = Field(
+        description="执行计划中声明的输出名称；缺少历史计划时可能为空。没有输出事件不代表没有声明输出。"
+    )
+    outputs: list[RunOutputEvent] = Field(
+        description="本次扫描范围内该步骤的全部输出事件。相同输出名可能因动态输出、重试及 IO Manager 处理而出现多次；未产生输出时为空。"
+    )
+
+
+class RunOutputsResponse(BaseModel):
+    run_id: str = Field(description="被查询的 Run ID。", examples=[EXAMPLE_RUN_ID])
+    run_status: DagsterRunStatus = Field(
+        description="读取步骤快照时 Dagster 报告的 Run 状态；与后续事件查询不构成原子快照。"
+    )
+    execution_plan_available: bool = Field(
+        description="是否取得运行的执行计划。false 时无法补齐既无步骤统计也无输出事件的未启动 op，items 仅包含可见条目。"
+    )
+    items: list[RunStepOutputs] = Field(
+        description="执行计划、步骤统计和本次输出事件中可见的步骤。一个 op 的多个动态实例可分别返回；历史计划缺失时无法补齐没有统计或事件的步骤。"
+    )
+    scanned_events: int = Field(
+        description="本次实际扫描的全部 Dagster 事件数量，包括没有输出的事件；不等于返回的输出条数。"
+    )
+    next_cursor: str | None = Field(
+        None,
+        description="本次扫描结束位置的 Dagster 事件游标；可继续增量读取，即使 has_more=false 也可稍后用于轮询。不要使用 Run 列表游标。",
+    )
+    has_more: bool = Field(
+        description="查询时刻是否还有事件未扫描；达到 max_events 时可能为 true，需要携带 next_cursor 继续查询。"
+    )
+    complete: bool = Field(
+        description="仅当本次未传 cursor 且扫描到当前事件尾部时为 true，表示本次响应包含从头至当前尾部的输出事件；不表示 Run 已结束，也不保证历史执行计划存在。"
+    )
+
+
+OUTPUTS_EXAMPLE = {
+    "run_id": EXAMPLE_RUN_ID,
+    "run_status": "SUCCESS",
+    "execution_plan_available": True,
+    "items": [
+        {
+            "step_key": "extract",
+            "op_handle": "extract",
+            "kind": "COMPUTE",
+            "status": "SUCCESS",
+            "started_at": "2026-11-08T00:00:01Z",
+            "ended_at": "2026-11-08T00:00:02Z",
+            "attempts": [
+                {
+                    "started_at": "2026-11-08T00:00:01Z",
+                    "ended_at": "2026-11-08T00:00:02Z",
+                }
+            ],
+            "declared_outputs": ["result"],
+            "outputs": [
+                {
+                    "event_type": "STEP_OUTPUT",
+                    "output_name": "result",
+                    "timestamp": "2026-11-08T00:00:02Z",
+                    "type_check_success": True,
+                    "manager_key": None,
+                    "metadata": [
+                        {
+                            "label": "api_value",
+                            "type": "JsonMetadataEntry",
+                            "description": None,
+                            "value": {"rows": 12},
+                            "value_available": True,
+                            "truncated": False,
+                        }
+                    ],
+                    "value_available": True,
+                    "value": {"rows": 12},
+                    "value_unavailable_reason": None,
+                    "value_source": "api_value",
+                },
+                {
+                    "event_type": "HANDLED_OUTPUT",
+                    "output_name": "result",
+                    "timestamp": "2026-11-08T00:00:02Z",
+                    "type_check_success": None,
+                    "manager_key": "io_manager",
+                    "metadata": [
+                        {
+                            "label": "path",
+                            "type": "PathMetadataEntry",
+                            "description": None,
+                            "value": "/storage/run/extract/result",
+                            "value_available": True,
+                            "truncated": False,
+                        }
+                    ],
+                    "value_available": False,
+                    "value": None,
+                    "value_unavailable_reason": "NOT_EXPOSED",
+                    "value_source": None,
+                },
+            ],
+        }
+    ],
+    "scanned_events": 10,
+    "next_cursor": "opaque-dagster-event-cursor",
+    "has_more": False,
+    "complete": True,
+}
 
 
 JOB_EXAMPLE = {
@@ -491,6 +697,130 @@ def create_discovery_router(get_adapter, verify_token) -> APIRouter:
         failure_summary 是运行状态/步骤级摘要，精确 Python 异常与事件详情使用 events 接口查询。
         """
         return adapter.get_run(run_id)
+
+    output_responses = responses(
+        "步骤状态、逐次输出事件及可读取的实际值。", OUTPUTS_EXAMPLE
+    )
+    output_responses[200]["content"] = {
+        "application/json": {
+            "examples": {
+                "readable_value": {
+                    "summary": "成功步骤的 JSON 结果和 IO Manager 事件",
+                    "value": OUTPUTS_EXAMPLE,
+                },
+                "not_started": {
+                    "summary": "计划中的 op 尚未开始，没有输出事件",
+                    "value": {
+                        **OUTPUTS_EXAMPLE,
+                        "run_status": "QUEUED",
+                        "items": [
+                            {
+                                **OUTPUTS_EXAMPLE["items"][0],
+                                "status": "NOT_STARTED",
+                                "started_at": None,
+                                "ended_at": None,
+                                "attempts": [],
+                                "outputs": [],
+                            }
+                        ],
+                        "scanned_events": 0,
+                    },
+                },
+                "failed_after_output": {
+                    "summary": "op 产生输出后仍可失败；没有导出结果的事件不可读",
+                    "value": {
+                        **OUTPUTS_EXAMPLE,
+                        "run_status": "FAILURE",
+                        "items": [
+                            {
+                                **OUTPUTS_EXAMPLE["items"][0],
+                                "status": "FAILURE",
+                                "outputs": [OUTPUTS_EXAMPLE["items"][0]["outputs"][1]],
+                            }
+                        ],
+                    },
+                },
+                "partial": {
+                    "summary": "达到扫描上限，需继续读取游标",
+                    "value": {
+                        **OUTPUTS_EXAMPLE,
+                        "scanned_events": 10000,
+                        "has_more": True,
+                        "complete": False,
+                    },
+                },
+            }
+        }
+    }
+
+    @router.get(
+        "/runs/{run_id}/outputs",
+        response_model=RunOutputsResponse,
+        tags=["Runs"],
+        summary="查询各 op 的输出和状态",
+        operation_id="get_run_outputs",
+        responses=output_responses,
+    )
+    def outputs(
+        run_id: RunId,
+        cursor: Annotated[
+            NonEmpty | None,
+            Query(
+                description="上次响应的 next_cursor；不传时从事件开头扫描。传入游标时 outputs 只包含本段事件，步骤状态仍返回当前统计快照。",
+                examples=["opaque-dagster-event-cursor"],
+            ),
+        ] = None,
+        max_events: Annotated[
+            int,
+            Query(
+                ge=1,
+                le=20000,
+                description="本次最多扫描的全部事件数，默认 10000；包括普通日志和非输出事件。达到上限后通过 has_more 和 next_cursor 继续。",
+                examples=[10000],
+            ),
+        ] = 10000,
+        value_metadata_key: Annotated[
+            NonEmpty,
+            Query(
+                max_length=200,
+                description="业务明确导出的实际结果元数据标签，默认 api_value。不会自动把其他元数据、路径或日志当作实际值。",
+                examples=["api_value"],
+            ),
+        ] = "api_value",
+        adapter: DagsterAdapter = adapter_dependency,
+    ):
+        """读取 Run 的每个可见 op 执行步骤及输出，需要 read 权限，仅读取 Dagster。
+
+        支持未开始、执行中、成功、失败、跳过以及重试。既没有步骤统计也没有事件的计划步骤标为 NOT_STARTED；
+        已有输出却缺统计、或统计状态无法确定时标为 UNKNOWN。
+        Run 为 CANCELED 时不推断所有步骤的状态。一个 op 的动态执行实例会分别返回，未解析模板通过 kind 区分。
+        历史执行计划缺失时，仅能列出步骤统计和事件中可见的条目。
+
+        outputs 逐个保留 STEP_OUTPUT 与 HANDLED_OUTPUT，不按输出名覆盖。前者表示输出和类型检查，
+        后者表示 IO Manager 已处理；都不保证实际值可读。Dagster 1.13.26 GraphQL 不暴露动态输出的 mapping_key，
+        因而同名动态输出保留为独立事件，但本接口不能可靠标识每个动态输出项的 mapping_key。
+
+        实际值仅从 value_metadata_key 指定的明确导出元数据读取，支持 JSON、Text、Int、Float、Bool 和 Null。
+        业务 op 可调用 context.add_output_metadata({"api_value": MetadataValue.json(result)}) 导出 JSON 结果。
+        value_available=true 且 value=null 表示实际结果就是 null；false 时必须检查 value_unavailable_reason。
+        普通 Out/return 由 IO Manager 保存，不会自动成为 API 可读值；文件路径、URL、pickle 或任意 Python 对象不直接读取。
+        实际 JSON 值最多嵌套 64 层，过深返回 INVALID_VALUE。单值上限 64 KiB，本次实际值累计上限 1 MiB；
+        元数据预览单项最多约 4 KiB，所有预览另共享 1 MiB。
+        元数据截断由 truncated=true/value_available=false 标识；以上分别为值和预览预算，不是整份 HTTP 响应大小限制。
+        RESPONSE_LIMIT 的输出事件仍会推进扫描游标；若要读取被预算省略的值，应从较早的游标减小 max_events 重读。
+
+        max_events 限制全部扫描事件数。has_more=true 时携带 next_cursor 继续，不能把局部结果当完整输出。
+        complete=true 仅表示本次从头扫描到了当前事件尾，不表示 Run 已完成；带 cursor 的增量响应 complete=false。
+        complete=true 也不保证全部实际值都可读取，仍须逐项检查 value_available。
+        游标到尾后仍可继续轮询。步骤统计与事件分开读取，运行中查询不是原子快照。
+        本接口时间均为 UTC ISO 8601；旧 events 接口仍返回 Dagster 原生毫秒时间戳。
+        """
+        return adapter.get_run_outputs(
+            run_id,
+            cursor=cursor,
+            max_events=max_events,
+            value_metadata_key=value_metadata_key,
+        )
 
     @router.get(
         "/runs/{run_id}/events",

@@ -21,7 +21,7 @@ import time
 import tomllib
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -413,6 +413,110 @@ def check(environment):
         assert status == 422 and count_submissions() == optional_key_before + 1, error
     print(
         "PASS body/header key alternatives, cross-source replay and conflicting/missing key rejection",
+        flush=True,
+    )
+
+    output_job = next(
+        job for job in jobs["items"] if job["job_name"] == "acceptance_outputs_job"
+    )
+    status, output_run = api(
+        "/api/v1/runs/submit", "POST", {"job_id": output_job["job_id"]}
+    )
+    assert status == 201, (status, output_run)
+    wait_until(
+        lambda: run_status(output_run["run_id"]) == "SUCCESS",
+        "output fixture completion",
+    )
+    outputs_url = "/api/v1/runs/" + output_run["run_id"] + "/outputs"
+    status, outputs = api(outputs_url)
+    assert status == 200 and outputs["run_status"] == "SUCCESS", (status, outputs)
+    assert outputs["complete"] is True and outputs["has_more"] is False, outputs
+    assert outputs["scanned_events"] > 5, outputs
+    by_step = {step["step_key"]: step for step in outputs["items"]}
+    assert set(by_step) == {"exported_outputs", "unexported_output"}, by_step
+    assert all(step["status"] == "SUCCESS" for step in by_step.values()), by_step
+    exported = by_step["exported_outputs"]
+    assert set(exported["declared_outputs"]) == {
+        "payload",
+        "null_value",
+        "zero",
+        "false_value",
+    }, exported
+    values = {
+        output["output_name"]: output
+        for output in exported["outputs"]
+        if output["event_type"] == "STEP_OUTPUT"
+    }
+    assert set(values) == {"payload", "null_value", "zero", "false_value"}, values
+    assert all(
+        output["value_available"] and output["value_source"] == "api_value"
+        for output in values.values()
+    ), values
+    assert values["payload"]["value"] == {"numbers": [1, 2], "ok": True}, values
+    assert (
+        values["null_value"]["value"] is None
+        and values["zero"]["value"] == 0
+        and values["false_value"]["value"] is False
+    ), values
+    assert all(
+        output["value_unavailable_reason"] is None for output in values.values()
+    ), values
+    unexported = by_step["unexported_output"]["outputs"]
+    assert any(output["event_type"] == "STEP_OUTPUT" for output in unexported), (
+        unexported
+    )
+    assert all(
+        not output["value_available"]
+        and output["value_unavailable_reason"] == "NOT_EXPOSED"
+        for output in unexported
+    ), unexported
+    status, custom = api(outputs_url + "?value_metadata_key=custom_value")
+    assert status == 200, custom
+    assert any(
+        output["value_available"] and output["value_source"] == "custom_value"
+        for step in custom["items"]
+        for output in step["outputs"]
+    ), custom
+
+    def output_signatures(body):
+        return [
+            (
+                step["step_key"],
+                output["event_type"],
+                output["output_name"],
+                output["timestamp"],
+                output["value_available"],
+                output["value"],
+            )
+            for step in body["items"]
+            for output in step["outputs"]
+        ]
+
+    expected_outputs = output_signatures(outputs)
+    paged_outputs, cursor, page_count = [], None, 0
+    for _ in range(100):
+        query = {"max_events": 5, **({"cursor": cursor} if cursor else {})}
+        status, page = api(outputs_url + "?" + urlencode(query))
+        assert status == 200 and page["scanned_events"] <= 5, (status, page)
+        assert all(step["status"] == "SUCCESS" for step in page["items"]), page
+        paged_outputs.extend(output_signatures(page))
+        page_count += 1
+        if cursor is not None:
+            assert page["complete"] is False, page
+        if not page["has_more"]:
+            break
+        assert page["complete"] is False and page["next_cursor"] != cursor, page
+        cursor = page["next_cursor"]
+    else:
+        raise AssertionError("Output event pagination did not terminate")
+    assert page_count > 1, page_count
+    assert sorted(paged_outputs, key=repr) == sorted(expected_outputs, key=repr), (
+        paged_outputs,
+        expected_outputs,
+    )
+    assert api("/api/v1/runs/missing-output-acceptance-run/outputs")[0] == 404
+    print(
+        "PASS per-op output states, explicitly exported JSON/null/scalars, unreadable values and complete event pagination",
         flush=True,
     )
 

@@ -118,6 +118,7 @@ export APP_API_KEYS_JSON='[
 | `GET` | `/api/v1/runs` | 过滤、分页查询运行列表 |
 | `GET` | `/api/v1/runs/{run_id}` | 查询运行详情、时间和失败摘要 |
 | `GET` | `/api/v1/runs/{run_id}/events` | 按游标增量读取事件 |
+| `GET` | `/api/v1/runs/{run_id}/outputs` | 查询各 op 执行步骤的状态、输出事件及可读取的实际值 |
 | `GET` | `/api/v1/submissions/{submission_id}` | 只读本地提交记录，无需原请求配置 |
 | `POST` | `/api/v1/submissions/{submission_id}/reconcile` | 查询已有提交的运行，更新核对结果，不创建任务 |
 | `POST` | `/api/v1/runs/terminate-batch` | 批量终止，逐项返回结果 |
@@ -276,6 +277,64 @@ curl --fail-with-body --get "http://localhost:8080/api/v1/runs/$RUN_ID/events" \
 
 详情提供运行状态、开始／结束时间、标签、父／根 Run ID、失败摘要和来源字段 `job_id`、`repository_location_name`、`repository_name`；历史运行缺少来源时，这些来源字段可为 `null`。列表／详情不会默认返回整份运行配置。事件接口提供 Dagster 结构化事件，原始 stdout／stderr 的完整下载不在该接口契约中。运行 `SUCCESS` 也不表示网关能够直接返回任意 Python 业务输出，输出读取需依据资产元数据或业务约定。
 
+### 各 op 的输出和状态
+
+```bash
+curl --fail-with-body \
+  "http://localhost:8080/api/v1/runs/$RUN_ID/outputs" \
+  -H "Authorization: Bearer $APP_API_TOKEN"
+```
+
+此接口需要 `read` 权限，只读取已有 Run。返回 `run_status` 和 `items`；每项包含 `step_key`、`op_handle`、步骤状态、UTC 开始／结束时间、重试尝试、声明输出名以及逐次输出事件。执行中、失败、跳过及计划中未启动的步骤均可查询。未启动状态为网关提供的 `NOT_STARTED`；取消整个 Run 不会被直接解释为所有步骤都已取消。
+
+一个 op 的动态执行实例可有不同 `step_key`，但共享 `op_handle`。未解析的动态模板通过 `kind` 区分。历史 Run 如果缺少执行计划，`execution_plan_available=false`，无法补齐既无步骤统计也无事件的未启动 op。
+
+`outputs` 独立保留 `STEP_OUTPUT` 和 `HANDLED_OUTPUT`：前者表示产生输出及类型检查，后者表示 IO Manager 处理输出。同名输出可能因为重试或动态输出多次出现，不按名称覆盖，也不自动合并两个事件的元数据。Dagster 1.13.26 GraphQL 没有提供动态输出的 `mapping_key`，所以接口保留各个事件，但不能可靠补出动态输出项的映射键。
+
+实际值与输出元数据分开表达：
+
+| 字段 | 含义 |
+| --- | --- |
+| `value_available=true` | 已读取业务明确导出的实际值；此时 `value=null` 表示实际结果就是 `null` |
+| `value_available=false` | 检查 `value_unavailable_reason`，不能把 `value=null` 当作实际输出 |
+| `value_source` | 用于读取值的元数据标签，默认是 `api_value` |
+| `metadata` | 事件的元数据预览，包括原生类型、标签和值；普通元数据不自动等于实际返回值 |
+
+普通 `return`／`Out` 的实际对象由 IO Manager 保存，可能位于内存、文件或数据库中。网关没有对应 Job 的运行资源与通用对象读取入口，因此这一版仅从业务明确导出的输出元数据中读取 JSON 值，支持 JSON、Text、Int、Float、Bool 和 Null 类型。不会仅凭文件路径或 URL 读取内容，也不反序列化 pickle。已有 Run 若未导出结果，仍会返回可见的状态、输出事件和元数据，并标记 `NOT_EXPOSED`。
+
+业务 op 可以显式导出结果，例如：
+
+```python
+from dagster import MetadataValue, op
+
+
+@op
+def calculate(context):
+    result = {"total": 42, "items": ["a", "b"]}
+    context.add_output_metadata({"api_value": MetadataValue.json(result)})
+    return result
+```
+
+这里的 `result` 是字典；`MetadataValue.json` 用于字典、数组或 `None`。标量可直接导出为原生元数据，例如 `context.add_output_metadata({"api_value": 0})`，也可使用 `MetadataValue.int`、`MetadataValue.bool`、`MetadataValue.text`。这样数字 `0`、布尔 `false` 和明确的 `null` 都能与“未读取到值”区分。
+
+多输出 op 可以为每个 `Output` 添加相同约定标签的元数据，或在 `context.add_output_metadata` 中指定 `output_name`。接口根据事件的 `output_name` 分别返回。业务使用其他标签时，可通过 `?value_metadata_key=your_result_key` 指定；只有明确代表实际结果的元数据标签才应这样使用。
+
+不可读取原因包括：`NOT_EXPOSED`（没有明确导出）、`INVALID_VALUE`（类型不支持、不是合法有限 JSON 或嵌套超过 64 层）、`VALUE_TOO_LARGE`（单个实际值超过 64 KiB）、`RESPONSE_LIMIT`（本次实际值累计超过 1 MiB）。元数据预览单项最多约 4 KiB，另共享 1 MiB 预算；截断项有 `truncated=true`、`value_available=false`。这些是分别对实际值与元数据预览的预算，不是整份 HTTP 响应的大小上限。
+
+`RESPONSE_LIMIT` 的事件仍属于已扫描事件，游标不会为省略的值停留。需要重新读取这些值时，应从较早的游标减小 `max_events` 重读；`complete=true` 也不保证所有实际值可读，仍须逐项检查 `value_available`。
+
+接口默认最多扫描 10000 个事件，可设置 `max_events=1..20000`；扫描数包含普通日志及非输出事件。达到上限时，使用 `next_cursor` 继续查询：
+
+```bash
+curl --fail-with-body --get \
+  "http://localhost:8080/api/v1/runs/$RUN_ID/outputs" \
+  -H "Authorization: Bearer $APP_API_TOKEN" \
+  --data-urlencode "cursor=$NEXT_CURSOR" \
+  --data-urlencode 'max_events=10000'
+```
+
+`has_more=true` 表示查询时仍有未扫描事件。`complete=true` 仅表示本次从事件开头扫描到了当前尾部，不表示 Run 已完成；传入 `cursor` 的增量响应为 `complete=false`。增量响应只包含本段的输出事件，而步骤状态仍是读取时的统计快照。即使到尾也可保留游标继续轮询。步骤统计与事件查询不是原子快照；本接口统一使用 UTC ISO 8601 时间，旧 `/events` 的原生毫秒时间戳保持兼容。
+
 ### 批量终止
 
 ```bash
@@ -338,7 +397,7 @@ curl --fail-with-body -X POST http://localhost:8080/api/v1/submit_job \
 
 ## 版本、测试与发布
 
-版本格式为 `<Dagster 主版本.次版本.补丁版本>.<私有修订号>`。`1.13.26.5` 表示依赖 Dagster `1.13.26` 的第 5 个网关修订。升级 Dagster 时同步更新前三段，仅修改网关时递增最后一段。HTTP API 的 `/api/v1` 契约与包版本独立演进。
+版本格式为 `<Dagster 主版本.次版本.补丁版本>.<私有修订号>`。`1.13.26.6` 表示依赖 Dagster `1.13.26` 的第 6 个网关修订。升级 Dagster 时同步更新前三段，仅修改网关时递增最后一段。HTTP API 的 `/api/v1` 契约与包版本独立演进。
 
 `pyproject.toml` 是网关版本的唯一来源，健康检查、OpenAPI 和 CI 发布使用相同版本。CI 校验版本与固定 Dagster 依赖的对应关系；已有版本标签属于其他提交时拒绝发布。
 

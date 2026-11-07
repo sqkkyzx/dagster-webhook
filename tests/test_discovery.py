@@ -134,9 +134,8 @@ def test_new_resources_document_security_models_examples_and_errors(resource_api
             )
             assert operation["tags"] and operation["security"]
             assert {"401", "404", "422", "502"} <= operation["responses"].keys()
-            assert operation["responses"]["200"]["content"]["application/json"][
-                "example"
-            ]
+            media = operation["responses"]["200"]["content"]["application/json"]
+            assert media.get("example") or media.get("examples")
             assert operation["responses"]["200"]["content"]["application/json"][
                 "schema"
             ]
