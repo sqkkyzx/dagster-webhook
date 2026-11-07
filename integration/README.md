@@ -47,7 +47,8 @@ uv pip install --python /tmp/dagster-gateway-acceptance/bin/python . dagster-web
 - 来源与提交关联保留标签在发往上游之前被拒绝。
 - 同 Key 并发提交仅发送一次 launch mutation，运行列表和事件可读取。
 - 查询每个 op 的状态与简化的 `output_name`、`output_value`，从挂载的默认 IO Manager
-  文件读取字典、null、0、false、字符串及没有导出元数据的值；移除测试文件后返回 null。
+  文件读取字典、嵌套的带时区 datetime、null、0、false、字符串及没有导出元数据的值；
+  日期时间保留时区偏移转换为 ISO 8601 字符串，移除测试文件后返回 null。
   小页游标遍历覆盖输出，不返回重复的 STEP_OUTPUT 详情。
 - 网关重启后使用持久化记录返回相同 Run。
 - 代理在 Dagster 确认接受后丢弃 launch 响应，验证 UNKNOWN、submission 查询、

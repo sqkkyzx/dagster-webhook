@@ -319,13 +319,29 @@ curl --fail-with-body \
 ```yaml
 services:
   dagster-webhook:
-    image: sqkkyzx/dagster-webhook:1.13.26.7
+    image: sqkkyzx/dagster-webhook:1.13.26.8
     volumes:
       - ./data:/data
       - ./storage/io-storage:/opt/dagster/dagster_home/storage:ro
 ```
 
-默认读取根目录为 `/opt/dagster/dagster_home/storage`，通过 `RUN_OUTPUT_STORAGE_ROOT` 可设置其他读取根目录。事件路径必须位于这个目录中；挂载到相同容器路径即可使用，无需修改 Job 来导出元数据。支持 JSON 文件及保存 JSON 基础类型的 pickle，元组转换为数组；其他对象、超过 64 层的数据或无法读取的结果统一返回 `null`。单文件与单值上限均为 16 MiB，本次结果累计上限为 32 MiB，超限输出返回 `null`。
+默认读取根目录为 `/opt/dagster/dagster_home/storage`，通过 `RUN_OUTPUT_STORAGE_ROOT` 可设置其他读取根目录。事件路径必须位于这个目录中；挂载到相同容器路径即可使用，无需修改 Job 来导出元数据。支持 JSON 文件及保存 JSON 基础类型的 pickle，元组转换为数组。`datetime`、`date`、`time` 转换为 ISO 8601 字符串，可嵌套在列表和字典中；已有 UTC 偏移会保留，无时区值不补时区。其他不支持的对象、超过 64 层的数据或无法读取的结果统一返回 `null`。单文件与单值上限均为 16 MiB，本次结果累计上限为 32 MiB，超限输出返回 `null`。
+
+例如，包含日期时间的合成结果可返回为：
+
+```json
+{
+  "output_name": "result",
+  "output_value": {
+    "generated_at": "2026-11-08T09:15:00+08:00",
+    "date": "2026-11-08",
+    "time": "09:15:00",
+    "items": [{"created_at": "2026-11-08T09:00:00"}]
+  }
+}
+```
+
+日期时间支持标准库固定偏移和 `zoneinfo` 时区，读取 Dagster 默认使用的 pickle protocol 4；第三方时区或其他不支持的 Python 类仍返回 `output_value: null`。文件未挂载或文件缺失时也返回 `null`。
 
 接口默认最多扫描 10000 个事件，`max_events` 范围为 1–20000。`has_more=true` 时携带 `next_cursor` 继续读取；`complete=true` 表示本次从事件开头扫描到当前尾部，不表示 Run 已结束或所有文件均可读取。传入 `cursor` 时只处理本段输出，运行中查询的步骤状态与事件不是原子快照。
 
@@ -391,7 +407,7 @@ curl --fail-with-body -X POST http://localhost:8080/api/v1/submit_job \
 
 ## 版本、测试与发布
 
-版本格式为 `<Dagster 主版本.次版本.补丁版本>.<私有修订号>`。`1.13.26.7` 表示依赖 Dagster `1.13.26` 的第 7 个网关修订。升级 Dagster 时同步更新前三段，仅修改网关时递增最后一段。HTTP API 的 `/api/v1` 契约与包版本独立演进。
+版本格式为 `<Dagster 主版本.次版本.补丁版本>.<私有修订号>`。`1.13.26.8` 表示依赖 Dagster `1.13.26` 的第 8 个网关修订。升级 Dagster 时同步更新前三段，仅修改网关时递增最后一段。HTTP API 的 `/api/v1` 契约与包版本独立演进。
 
 `pyproject.toml` 是网关版本的唯一来源，健康检查、OpenAPI 和 CI 发布使用相同版本。CI 校验版本与固定 Dagster 依赖的对应关系；已有版本标签属于其他提交时拒绝发布。
 

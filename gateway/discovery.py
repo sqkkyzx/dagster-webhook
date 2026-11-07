@@ -239,7 +239,7 @@ class RunOutputValue(BaseModel):
         description="op 的输出名称，普通单输出通常为 result。", examples=["result"]
     )
     output_value: JsonValue = Field(
-        description="从挂载存储文件中读出的 JSON 兼容结果。没有输出、没有可用路径、文件不存在、无法读取或无法转换时均为 null；实际结果为 null 时也返回 null。",
+        description="从挂载存储文件中读出的 JSON 兼容结果。datetime、date、time 对象转换为 ISO 8601 字符串，可嵌套在列表或字典中；保留已有 UTC 偏移，无时区值不补时区。没有输出、没有可用路径、文件不存在、无法读取或无法转换时均为 null；实际结果为 null 时也返回 null。",
     )
 
 
@@ -602,6 +602,31 @@ def create_discovery_router(get_adapter, verify_token) -> APIRouter:
                         ],
                     },
                 },
+                "datetime_value": {
+                    "summary": "嵌套的日期时间转为 ISO 8601 字符串",
+                    "value": {
+                        **OUTPUTS_EXAMPLE,
+                        "items": [
+                            {
+                                "step_key": "prepare_summary",
+                                "status": "SUCCESS",
+                                "outputs": [
+                                    {
+                                        "output_name": "result",
+                                        "output_value": {
+                                            "generated_at": "2026-11-08T09:15:00+08:00",
+                                            "date": "2026-11-08",
+                                            "time": "09:15:00",
+                                            "items": [
+                                                {"created_at": "2026-11-08T09:00:00"}
+                                            ],
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                },
                 "partial": {
                     "summary": "还有未扫描的事件，需继续读取游标",
                     "value": {**OUTPUTS_EXAMPLE, "has_more": True, "complete": False},
@@ -655,7 +680,10 @@ def create_discovery_router(get_adapter, verify_token) -> APIRouter:
         此接口使用后者读取文件；内存或自定义 IO Manager 不一定提供文件路径。
         网关默认读取 /opt/dagster/dagster_home/storage 目录，可通过 RUN_OUTPUT_STORAGE_ROOT 设置读取根目录。
         Compose 中应挂载真实存储到相同容器路径，例如 ./storage/io-storage:/opt/dagster/dagster_home/storage:ro。
-        支持 JSON 文件及保存 JSON 基础类型的 pickle，元组转为数组；其他对象返回 null。
+        支持 JSON 文件及保存 JSON 基础类型的 pickle，元组转为数组。
+        datetime、date、time 转为 ISO 8601 字符串，可嵌套在列表或字典中；已有 UTC 偏移保留，无时区值不补时区。
+        日期时间支持标准库固定偏移和 zoneinfo 时区，兼容 Dagster 默认使用的 pickle protocol 4；第三方时区不在支持范围内。
+        其他不支持的对象、缺失文件或未挂载的文件仍返回 null。
         单文件和单值上限均为 16 MiB，实际值最多 64 层，本次结果累计最多 32 MiB；超限输出返回 null。
 
         has_more=true 时携带 next_cursor 继续；complete=true 仅表示本次从头扫描到了当前事件尾部。

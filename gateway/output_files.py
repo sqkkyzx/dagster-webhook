@@ -1,5 +1,6 @@
 """Read mounted Dagster output files as bounded JSON-compatible values."""
 
+import datetime as dt
 import io
 import json
 import math
@@ -8,6 +9,7 @@ import pickle
 import pickletools
 import stat
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 DEFAULT_STORAGE_ROOT = "/opt/dagster/dagster_home/storage"
 MAX_FILE_BYTES = 16 * 1024 * 1024
@@ -15,8 +17,8 @@ MAX_VALUE_BYTES = 16 * 1024 * 1024
 MAX_JSON_DEPTH = 64
 MAX_PICKLE_MEMO_ENTRIES = 1_000_000
 
-# Dagster's filesystem IO manager pickles objects. Basic containers and scalar
-# values need no constructors, imported classes, persistent IDs or buffers.
+# Dagster's filesystem IO manager uses pickle protocol 4. Only the constructors
+# below may be resolved; extensions, arbitrary classes and object state stay blocked.
 _ALLOWED_PICKLE_OPCODES = frozenset(
     [
         "MARK",
@@ -72,13 +74,122 @@ _ALLOWED_PICKLE_OPCODES = frozenset(
         "BYTEARRAY8",
         "BINBYTES",
         "SHORT_BINBYTES",
+        "GLOBAL",
+        "STACK_GLOBAL",
+        "REDUCE",
     ]
 )
 
 
+def _packed_state(data, size):
+    if type(data) is not bytes or len(data) != size:
+        raise pickle.UnpicklingError("Invalid date/time state")
+    return data
+
+
+def _timezone_value(value):
+    if value is not None and type(value) not in {dt.timezone, ZoneInfo}:
+        raise pickle.UnpicklingError("Unsupported date/time zone")
+    return value
+
+
+def _restore_datetime(data, timezone=None):
+    data = _packed_state(data, 10)
+    return dt.datetime(
+        int.from_bytes(data[:2]),
+        data[2] & 0x7F,
+        data[3],
+        data[4],
+        data[5],
+        data[6],
+        int.from_bytes(data[7:]),
+        tzinfo=_timezone_value(timezone),
+        fold=data[2] >> 7,
+    )
+
+
+def _restore_date(data):
+    data = _packed_state(data, 4)
+    return dt.date(int.from_bytes(data[:2]), data[2], data[3])
+
+
+def _restore_time(data, timezone=None):
+    data = _packed_state(data, 6)
+    return dt.time(
+        data[0] & 0x7F,
+        data[1],
+        data[2],
+        int.from_bytes(data[3:]),
+        tzinfo=_timezone_value(timezone),
+        fold=data[0] >> 7,
+    )
+
+
+def _restore_timedelta(days, seconds, microseconds):
+    # Only canonical pickle state is needed to restore fixed-offset time zones.
+    if (
+        any(type(value) is not int for value in (days, seconds, microseconds))
+        or not -999999999 <= days <= 999999999
+        or not 0 <= seconds < 86400
+        or not 0 <= microseconds < 1000000
+    ):
+        raise pickle.UnpicklingError("Invalid time zone offset")
+    return dt.timedelta(days=days, seconds=seconds, microseconds=microseconds)
+
+
+def _restore_timezone(offset, name=None):
+    if type(offset) is not dt.timedelta or (name is not None and type(name) is not str):
+        raise pickle.UnpicklingError("Invalid fixed time zone")
+    return dt.timezone(offset) if name is None else dt.timezone(offset, name)
+
+
+def _restore_zoneinfo(key):
+    if (
+        type(key) is not str
+        or len(key) > 255
+        or any(part in {"", ".", ".."} for part in key.split("/"))
+        or "\\" in key
+        or "\0" in key
+    ):
+        raise pickle.UnpicklingError("Invalid IANA time zone key")
+    try:
+        return ZoneInfo(key)
+    except ZoneInfoNotFoundError:
+        raise pickle.UnpicklingError("Unknown IANA time zone") from None
+
+
+def _restore_zoneinfo_pickle(key, from_cache):
+    if type(from_cache) is not int or from_cache not in {0, 1}:
+        raise pickle.UnpicklingError("Invalid IANA time zone pickle state")
+    # Cache identity has no effect on the JSON value or the offset at this instant.
+    return _restore_zoneinfo(key)
+
+
+def _zoneinfo_getattr(target, name):
+    # ZoneInfo pickles encode getattr(ZoneInfo, "_unpickle"). Never expose the
+    # builtin getattr or any class attributes to a file-controlled callable chain.
+    if target is not _restore_zoneinfo or type(name) is not str or name != "_unpickle":
+        raise pickle.UnpicklingError("Unsupported pickle attribute lookup")
+    return _restore_zoneinfo_pickle
+
+
+_PICKLE_CONSTRUCTORS = {
+    ("datetime", "datetime"): _restore_datetime,
+    ("datetime", "date"): _restore_date,
+    ("datetime", "time"): _restore_time,
+    ("datetime", "timedelta"): _restore_timedelta,
+    ("datetime", "timezone"): _restore_timezone,
+    ("zoneinfo", "ZoneInfo"): _restore_zoneinfo,
+    ("builtins", "getattr"): _zoneinfo_getattr,
+}
+
+
 class _RestrictedUnpickler(pickle.Unpickler):
     def find_class(self, module, name):
-        raise pickle.UnpicklingError("Output requires an unsupported Python class")
+        constructor = _PICKLE_CONSTRUCTORS.get((module, name))
+        if constructor is None:
+            raise pickle.UnpicklingError("Output requires an unsupported Python class")
+        return constructor
 
     def persistent_load(self, pid):
         raise pickle.UnpicklingError("Persistent output references are unsupported")
@@ -118,7 +229,7 @@ def _decode(data):
 
 
 def _json_compatible(value, maximum):
-    """Validate built-ins and charge encoded bytes before expanding aliases."""
+    """Convert known date/time types and bound JSON before expanding aliases."""
     remaining = maximum
     active = set()
 
@@ -137,6 +248,9 @@ def _json_compatible(value, maximum):
 
     def convert(item, depth):
         kind = type(item)
+        if kind in {dt.datetime, dt.date, dt.time}:
+            item = item.isoformat()
+            kind = str
         if item is None or kind in {bool, int, float, str}:
             if kind is float and not math.isfinite(item):
                 raise ValueError("Non-finite output value")
@@ -212,8 +326,9 @@ def read_output_file(
     """Return a mounted JSON/pickle value, or ``None`` when it cannot be read.
 
     ``root`` defaults to RUN_OUTPUT_STORAGE_ROOT, read on each call. Only basic
-    built-in JSON-compatible pickle values are supported; imported classes and
-    executable pickle operations are rejected. Tuples become JSON arrays.
+    JSON-compatible pickle values and standard date/time values are supported.
+    Date/time values become ISO strings; tuples become arrays. Only narrowly
+    validated date/time constructors are allowed, never arbitrary Python classes.
     """
     try:
         if (

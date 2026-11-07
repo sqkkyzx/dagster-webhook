@@ -1,6 +1,8 @@
 """Jobs used exclusively by the isolated acceptance environment."""
 
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from dagster import Definitions, Field, Out, Output, job, op
 
@@ -30,7 +32,13 @@ def acceptance_job():
     }
 )
 def exported_outputs():
-    payload = {"numbers": [1, 2], "ok": True}
+    payload = {
+        "numbers": [1, 2],
+        "ok": True,
+        "rows": [
+            {"scheduled_at": datetime(2026, 11, 7, 8, tzinfo=ZoneInfo("Asia/Shanghai"))}
+        ],
+    }
     yield Output(payload, "payload")
     yield Output(None, "null_value")
     yield Output(0, "zero")

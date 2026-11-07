@@ -463,7 +463,11 @@ def check(environment):
     assert all(
         set(output) == {"output_name", "output_value"} for output in values.values()
     ), values
-    assert values["payload"]["output_value"] == {"numbers": [1, 2], "ok": True}, values
+    assert values["payload"]["output_value"] == {
+        "numbers": [1, 2],
+        "ok": True,
+        "rows": [{"scheduled_at": "2026-11-07T08:00:00+08:00"}],
+    }, values
     assert (
         values["null_value"]["output_value"] is None
         and values["zero"]["output_value"] == 0

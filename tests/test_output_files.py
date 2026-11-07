@@ -1,10 +1,12 @@
-"""Mounted output loading never imports or executes persisted Python objects."""
+"""Mounted output loading only restores bounded values with known constructors."""
 
+import datetime as dt
 import json
 import os
 import pickle
 import struct
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -33,6 +35,43 @@ def test_json_files_and_tuple_arrays(tmp_path):
     path.write_text(json.dumps({"rows": 2, "ok": False}))
     assert read_output_file(path, root=tmp_path) == {"rows": 2, "ok": False}
     assert read_output_file(dump(tmp_path, (1, "a")), root=tmp_path) == [1, "a"]
+
+
+@pytest.mark.parametrize("protocol", [3, 4, 5])
+@pytest.mark.parametrize(
+    "value",
+    [
+        dt.date(2026, 11, 7),
+        dt.time(8, 30, 45, 123456),
+        dt.time(8, 30, tzinfo=dt.timezone(dt.timedelta(hours=-5), "fixed")),
+        dt.datetime(2026, 11, 7, 8, 30),
+        dt.datetime(2026, 11, 7, 8, 30, tzinfo=dt.UTC),
+        dt.datetime(2026, 11, 7, 8, 30, tzinfo=ZoneInfo("Asia/Shanghai")),
+        dt.datetime(
+            2026, 11, 1, 1, 30, tzinfo=ZoneInfo.no_cache("America/New_York"), fold=1
+        ),
+    ],
+)
+def test_date_time_values_nested_in_dagster_pickle(tmp_path, protocol, value):
+    # Old protocols do not preserve fold; the actual Dagster IO manager uses 4.
+    expected = (
+        value.replace(fold=0) if protocol == 3 and type(value) is dt.datetime else value
+    )
+    payload = [{"when": value, "items": (0, False, None)}]
+    path = dump(tmp_path, payload, protocol=protocol)
+    assert read_output_file(path, root=tmp_path) == [
+        {"when": expected.isoformat(), "items": [0, False, None]}
+    ]
+
+
+def test_date_time_json_limit_is_charged_after_conversion(tmp_path):
+    value = dt.datetime(2026, 11, 7, 8, tzinfo=ZoneInfo("Asia/Shanghai"))
+    path = dump(tmp_path, {"when": value})
+    maximum = len(json.dumps({"when": value.isoformat()}, separators=(",", ":")))
+    assert read_output_file(path, root=tmp_path, max_value_bytes=maximum) == {
+        "when": "2026-11-07T08:00:00+08:00"
+    }
+    assert read_output_file(path, root=tmp_path, max_value_bytes=maximum - 1) is None
 
 
 def test_env_root_is_read_each_time(tmp_path, monkeypatch):
@@ -152,6 +191,79 @@ def test_executable_pickle_is_never_executed(tmp_path):
     path = dump(tmp_path, MaliciousOutput(marker))
     assert read_output_file(path, root=tmp_path) is None
     assert not marker.exists()
+
+
+def test_cached_extension_cannot_bypass_constructor_allowlist(tmp_path, monkeypatch):
+    marker = tmp_path / "extension-executed"
+    monkeypatch.setitem(pickle._extension_cache, 240, _write_marker)
+    # EXT may resolve directly from the shared cache without calling find_class.
+    argument = pickle.dumps(str(marker), protocol=4)[11:-1]
+    path = tmp_path / "extension"
+    path.write_bytes(b"\x80\x04\x82\xf0" + argument + b"\x85R.")
+    assert read_output_file(path, root=tmp_path) is None
+    assert not marker.exists()
+
+
+class ReducedOutput:
+    def __init__(self, constructor, arguments):
+        self.constructor = constructor
+        self.arguments = arguments
+
+    def __reduce__(self):
+        return self.constructor, self.arguments
+
+
+@pytest.mark.parametrize(
+    "target,attribute",
+    [
+        (ZoneInfo, "__new__"),
+        (ZoneInfo, "from_file"),
+        (ZoneInfo, "clear_cache"),
+        (dt.datetime, "__new__"),
+        (getattr, "__globals__"),
+    ],
+)
+def test_getattr_is_limited_to_zoneinfo_pickle_restore(tmp_path, target, attribute):
+    value = ReducedOutput(getattr, (target, attribute))
+    assert read_output_file(dump(tmp_path, value), root=tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    "constructor,arguments",
+    [
+        (dt.datetime, (b"bad",)),
+        (dt.datetime, (b"\x07\xea\x0b\x07\x19\x00\x00\x00\x00\x00",)),
+        (dt.datetime, (b"\x07\xea\x0b\x07\x08\x00\x00\x00\x00\x00", "UTC")),
+        (dt.date, (b"\x07\xea\x02\x1e",)),
+        (dt.time, (b"\x18\x00\x00\x00\x00\x00",)),
+        (dt.timedelta, (0, 86400, 0)),
+        (dt.timezone, ("UTC",)),
+        (ZoneInfo._unpickle, ("UTC", 2)),
+        (ZoneInfo._unpickle, ("UTC", True)),
+    ],
+)
+def test_invalid_date_time_pickle_state_returns_null(tmp_path, constructor, arguments):
+    value = ReducedOutput(constructor, arguments)
+    assert read_output_file(dump(tmp_path, value), root=tmp_path) is None
+
+
+@pytest.mark.parametrize(
+    "key", ["/etc/passwd", "../UTC", "Asia/../UTC", "", "Unknown/Zone"]
+)
+def test_zoneinfo_file_keys_are_validated(tmp_path, key):
+    value = ReducedOutput(ZoneInfo, (key,))
+    assert read_output_file(dump(tmp_path, value), root=tmp_path) is None
+
+
+def test_missing_timezone_database_returns_null(tmp_path, monkeypatch):
+    value = dt.datetime(2026, 11, 7, tzinfo=ZoneInfo("Asia/Shanghai"))
+    path = dump(tmp_path, value)
+
+    def missing_zone(key):
+        raise output_files.ZoneInfoNotFoundError(key)
+
+    monkeypatch.setattr(output_files, "ZoneInfo", missing_zone)
+    assert read_output_file(path, root=tmp_path) is None
 
 
 def test_extreme_pickle_memo_index_is_rejected_before_allocation(tmp_path, monkeypatch):
