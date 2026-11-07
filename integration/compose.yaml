@@ -1,0 +1,33 @@
+services:
+  dagster:
+    build:
+      context: .
+      dockerfile: Dockerfile.dagster
+    networks: [acceptance]
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.dagster
+    command: ["python", "upstream_proxy.py", "--host", "0.0.0.0", "--port", "3001", "--upstream", "http://dagster:3000"]
+    ports:
+      - "127.0.0.1:${DAGSTER_ACCEPTANCE_PROXY_PORT:?required}:3001"
+    networks: [acceptance]
+  gateway:
+    image: ${DAGSTER_ACCEPTANCE_IMAGE:?required}
+    environment:
+      APP_API_TOKEN: ${DAGSTER_ACCEPTANCE_TOKEN:?required}
+      DAGSTER_URL: http://proxy:3001
+      DAGSTER_TIMEOUT: "20"
+      DAGSTER_READINESS_TIMEOUT: "1"
+      IDEMPOTENCY_DB_PATH: /data/idempotency.sqlite3
+      IDEMPOTENCY_LEASE_SECONDS: "2"
+    ports:
+      - "127.0.0.1:${DAGSTER_ACCEPTANCE_GATEWAY_PORT:?required}:8080"
+    volumes:
+      - gateway-data:/data
+    networks: [acceptance]
+volumes:
+  gateway-data:
+networks:
+  acceptance:
+    internal: true

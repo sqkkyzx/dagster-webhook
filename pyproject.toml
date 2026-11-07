@@ -1,15 +1,21 @@
 [project]
 name = "dagster-webhook"
-version = "1.13.4.0"
+version = "1.13.26.4"
 description = "A FastAPI-based RPC/Webhook gateway for Dagster GraphQL API with authentication and monitoring endpoints"
 requires-python = ">=3.13"
 dependencies = [
-    "dagster==1.13.4",
+    "dagster==1.13.26",
     "dagster-graphql",
     "fastapi",
     "pydantic",
     "uvicorn",
 ]
+
+# The gateway runs directly from its source directory; install project metadata
+# and dependencies without auto-discovering unrelated top-level modules.
+[tool.setuptools]
+py-modules = []
+
 [tool.uv]
 environments = [
     "sys_platform == 'win32'",

@@ -1,0 +1,5 @@
+telemetry:
+  enabled: false
+run_coordinator:
+  module: dagster._core.run_coordinator.default_run_coordinator
+  class: DefaultRunCoordinator

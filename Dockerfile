@@ -1,18 +1,23 @@
 FROM python:3.14-slim
 
-ENV DAGSTER_HOME=/opt/dagster/dagster_home/ \
-    PYTHONUNBUFFERED=1
+ENV PYTHONUNBUFFERED=1 \
+    APP_HOST=0.0.0.0 \
+    APP_PORT=8080 \
+    IDEMPOTENCY_DB_PATH=/data/idempotency.sqlite3
 
 RUN pip install --no-cache-dir --upgrade pip uv
 
-WORKDIR $DAGSTER_HOME
+WORKDIR /app
 
 COPY pyproject.toml uv.lock* ./
 
 RUN uv pip install --system --no-cache-dir --no-verify-hashes .
 
-EXPOSE 4000
+COPY main.py project_metadata.py ./
+COPY gateway/ ./gateway/
 
-ENTRYPOINT ["dagster", "code-server", "start", "-h", "0.0.0.0", "-p", "4000"]
+VOLUME ["/data"]
 
-CMD ["-f", "definitions.py"]
+EXPOSE 8080
+
+CMD ["python", "main.py"]

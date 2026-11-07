@@ -1,16 +1,46 @@
-name: 构建并推送镜像
+name: 测试、构建并推送镜像
 
 on:
   push:
     branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+permissions:
+  contents: read
 
 env:
   GHCR_IMAGE: ghcr.io/${{ github.repository }}
   DOCKERHUB_IMAGE: ${{ github.repository }}
   RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
 jobs:
-  build-and-push:
+  tests:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: [ "3.13", "3.14" ]
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v4
+      - name: 配置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade uv
+          uv pip install --system . pytest httpx
+      - name: 验证版本并运行测试
+        run: |
+          python -c "from project_metadata import VERSION, DAGSTER_VERSION; print(VERSION, DAGSTER_VERSION)"
+          python -m pytest -q
+
+  build-and-push:
+    needs: tests
+    runs-on: ubuntu-latest
+    concurrency:
+      group: docker-publish-${{ github.repository }}
+      cancel-in-progress: false
     permissions:
       contents: write
       packages: write
@@ -24,27 +54,23 @@ jobs:
       - name: ⚙️ 配置 Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: 🏷️ 提取 pyproject.toml 版本号
+      - name: 配置验收脚本 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: 🏷️ 校验并读取项目版本号
         id: get_version
         run: |
-          # 提取 version = "" 中的数字
-          VERSION=$(grep -m 1 'version = ' pyproject.toml | cut -d '"' -f 2)
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "提取到版本号: $VERSION"
-
-      - name: 🔑 登录 GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 🔑 登录 Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          python - <<'PY'
+          import os
+          from project_metadata import VERSION, DAGSTER_VERSION
+          with open(os.environ["GITHUB_ENV"], "a") as stream:
+              stream.write(f"VERSION={VERSION}\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
+              stream.write(f"version={VERSION}\n")
+          print(f"网关版本: {VERSION}; Dagster 依赖版本: {DAGSTER_VERSION}")
+          PY
 
       - name: 📝 准备 Docker 镜像元数据
         id: meta
@@ -54,36 +80,75 @@ jobs:
             ${{ env.GHCR_IMAGE }}
             ${{ env.DOCKERHUB_IMAGE }}
           tags: |
-            # 只有在 master 分支推送时，才打上 latest 标签
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/master' }}
-            # 使用从 pyproject.toml 提取的版本号
+            type=raw,value=latest
             type=raw,value=${{ env.VERSION }}
 
-      - name: 📦 构建并推送镜像
+      - name: 📦 构建待验收的成品镜像
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          load: true
+          push: false
+          tags: dagster-webhook:acceptance-${{ github.run_id }}-${{ github.run_attempt }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: 🔖 自动创建并推送 Git Tag
+      - name: 验收成品镜像及隔离 Dagster 工作流
+        timeout-minutes: 15
         run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          # 如果不存在该版本的 tag，则创建并推送
-          if ! git rev-parse "v${{ env.VERSION }}" >/dev/null 2>&1; then
-            git tag "v${{ env.VERSION }}"
-            git push origin "v${{ env.VERSION }}"
-            echo "已自动创建并推送 Tag: v${{ env.VERSION }}"
+          python integration/check.py --mode docker \
+            --image "dagster-webhook:acceptance-${{ github.run_id }}-${{ github.run_attempt }}"
+
+      - name: 🔖 校验并预留版本标签
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        run: |
+          git fetch --tags origin
+          tag="v${VERSION}"
+          if git show-ref --verify --quiet "refs/tags/$tag"; then
+            tagged_commit=$(git rev-parse "refs/tags/$tag^{commit}")
+            if [ "$tagged_commit" != "$GITHUB_SHA" ]; then
+              echo "::error::版本 $VERSION 已属于提交 $tagged_commit；请递增私有修订号后发布。"
+              exit 1
+            fi
+            echo "版本标签与当前提交一致，允许重新构建。"
           else
-            echo "Tag v${{ env.VERSION }} 已存在，跳过。"
+            # 在推送镜像前预留版本，失败后可从相同提交重新运行。
+            git tag "$tag" "$GITHUB_SHA"
+            git push origin "refs/tags/$tag"
           fi
 
+      - name: 🔑 登录 GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🔑 登录 Docker Hub
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 发布已经通过验收的同一个镜像
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        env:
+          IMAGE_TAGS: ${{ steps.meta.outputs.tags }}
+          ACCEPTED_IMAGE: dagster-webhook:acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          # 不重新构建：发布内容必须与启动验收的本地镜像一致。
+          while IFS= read -r image_tag; do
+            if [ -n "$image_tag" ]; then
+              docker tag "$ACCEPTED_IMAGE" "$image_tag"
+              docker push "$image_tag"
+            fi
+          done <<< "$IMAGE_TAGS"
+
       - name: 📢 发送钉钉构建通知
-        if: always()
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/master'
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         run: |

@@ -1,0 +1,10 @@
+FROM python:3.14-slim
+
+RUN pip install --no-cache-dir dagster==1.13.26 dagster-webserver==1.13.26
+
+WORKDIR /fixture
+COPY definitions.py upstream_proxy.py ./
+COPY dagster.yaml /opt/dagster/home/dagster.yaml
+ENV DAGSTER_HOME=/opt/dagster/home PYTHONUNBUFFERED=1
+
+CMD ["dagster-webserver", "-f", "/fixture/definitions.py", "-h", "0.0.0.0", "-p", "3000"]
