@@ -89,7 +89,7 @@ class Environment:
         self.env = {
             key: value
             for key, value in os.environ.items()
-            if not key.startswith(("DAGSTER_", "APP_", "IDEMPOTENCY_"))
+            if not key.startswith(("DAGSTER_", "APP_", "IDEMPOTENCY_", "RUN_OUTPUT_"))
         }
         self.env.update(
             DAGSTER_ACCEPTANCE_IMAGE=image or "unused-native-image",
@@ -181,6 +181,9 @@ class Environment:
                 "DAGSTER_READINESS_TIMEOUT": "1",
                 "IDEMPOTENCY_DB_PATH": str(self.directory / "idempotency.sqlite3"),
                 "IDEMPOTENCY_LEASE_SECONDS": "2",
+                "RUN_OUTPUT_STORAGE_ROOT": str(
+                    self.directory / "dagster-home" / "storage"
+                ),
             },
         )
 
@@ -190,6 +193,7 @@ class Environment:
         else:
             home = self.directory / "dagster-home"
             home.mkdir()
+            (home / "storage").mkdir()
             shutil.copy(FIXTURE / "dagster.yaml", home / "dagster.yaml")
             self.spawn(
                 "dagster",
@@ -247,6 +251,22 @@ class Environment:
             lambda: self.request(self.gateway_url + "/ready")[0] == 200,
             "gateway restart with retained idempotency storage",
         )
+
+    def remove_output_file(self, run_id, step_key, output_name):
+        """Delete only one artifact created in this disposable fixture."""
+        relative = Path(run_id) / step_key / output_name
+        if self.mode == "docker":
+            path = "/opt/dagster/home/storage/" + str(relative)
+            self.compose(
+                "exec",
+                "-T",
+                "dagster",
+                "python",
+                "-c",
+                "from pathlib import Path; Path(" + repr(path) + ").unlink()",
+            )
+        else:
+            (self.directory / "dagster-home" / "storage" / relative).unlink()
 
     def dump_logs(self):
         if self.mode == "docker":
@@ -431,62 +451,45 @@ def check(environment):
     status, outputs = api(outputs_url)
     assert status == 200 and outputs["run_status"] == "SUCCESS", (status, outputs)
     assert outputs["complete"] is True and outputs["has_more"] is False, outputs
-    assert outputs["scanned_events"] > 5, outputs
     by_step = {step["step_key"]: step for step in outputs["items"]}
     assert set(by_step) == {"exported_outputs", "unexported_output"}, by_step
     assert all(step["status"] == "SUCCESS" for step in by_step.values()), by_step
     exported = by_step["exported_outputs"]
-    assert set(exported["declared_outputs"]) == {
-        "payload",
-        "null_value",
-        "zero",
-        "false_value",
-    }, exported
-    values = {
-        output["output_name"]: output
-        for output in exported["outputs"]
-        if output["event_type"] == "STEP_OUTPUT"
-    }
-    assert set(values) == {"payload", "null_value", "zero", "false_value"}, values
-    assert all(
-        output["value_available"] and output["value_source"] == "api_value"
-        for output in values.values()
-    ), values
-    assert values["payload"]["value"] == {"numbers": [1, 2], "ok": True}, values
-    assert (
-        values["null_value"]["value"] is None
-        and values["zero"]["value"] == 0
-        and values["false_value"]["value"] is False
-    ), values
-    assert all(
-        output["value_unavailable_reason"] is None for output in values.values()
-    ), values
-    unexported = by_step["unexported_output"]["outputs"]
-    assert any(output["event_type"] == "STEP_OUTPUT" for output in unexported), (
-        unexported
+    values = {output["output_name"]: output for output in exported["outputs"]}
+    assert len(exported["outputs"]) == 5, exported
+    assert set(values) == {"payload", "null_value", "zero", "false_value", "text"}, (
+        values
     )
     assert all(
-        not output["value_available"]
-        and output["value_unavailable_reason"] == "NOT_EXPOSED"
-        for output in unexported
-    ), unexported
-    status, custom = api(outputs_url + "?value_metadata_key=custom_value")
-    assert status == 200, custom
-    assert any(
-        output["value_available"] and output["value_source"] == "custom_value"
-        for step in custom["items"]
-        for output in step["outputs"]
-    ), custom
+        set(output) == {"output_name", "output_value"} for output in values.values()
+    ), values
+    assert values["payload"]["output_value"] == {"numbers": [1, 2], "ok": True}, values
+    assert (
+        values["null_value"]["output_value"] is None
+        and values["zero"]["output_value"] == 0
+        and values["false_value"]["output_value"] is False
+        and values["text"]["output_value"] == "mounted output"
+    ), values
+    unexported = by_step["unexported_output"]["outputs"]
+    assert unexported == [{"output_name": "result", "output_value": 2}], unexported
+    assert set(outputs) == {
+        "run_id",
+        "run_status",
+        "items",
+        "next_cursor",
+        "has_more",
+        "complete",
+    }, outputs
+    assert all(
+        set(step) == {"step_key", "status", "outputs"} for step in outputs["items"]
+    ), outputs
 
     def output_signatures(body):
         return [
             (
                 step["step_key"],
-                output["event_type"],
                 output["output_name"],
-                output["timestamp"],
-                output["value_available"],
-                output["value"],
+                json.dumps(output["output_value"], ensure_ascii=False, sort_keys=True),
             )
             for step in body["items"]
             for output in step["outputs"]
@@ -497,7 +500,7 @@ def check(environment):
     for _ in range(100):
         query = {"max_events": 5, **({"cursor": cursor} if cursor else {})}
         status, page = api(outputs_url + "?" + urlencode(query))
-        assert status == 200 and page["scanned_events"] <= 5, (status, page)
+        assert status == 200, (status, page)
         assert all(step["status"] == "SUCCESS" for step in page["items"]), page
         paged_outputs.extend(output_signatures(page))
         page_count += 1
@@ -510,13 +513,26 @@ def check(environment):
     else:
         raise AssertionError("Output event pagination did not terminate")
     assert page_count > 1, page_count
-    assert sorted(paged_outputs, key=repr) == sorted(expected_outputs, key=repr), (
+    # Planned outputs may appear as null before their HANDLED_OUTPUT is in a
+    # page. Every readable full-snapshot value must still be observed.
+    assert set(expected_outputs) <= set(paged_outputs), (
         paged_outputs,
         expected_outputs,
     )
+    environment.remove_output_file(output_run["run_id"], "exported_outputs", "text")
+    status, missing_file = api(outputs_url)
+    assert status == 200, missing_file
+    missing_text = next(
+        output
+        for step in missing_file["items"]
+        if step["step_key"] == "exported_outputs"
+        for output in step["outputs"]
+        if output["output_name"] == "text"
+    )
+    assert missing_text["output_value"] is None, missing_text
     assert api("/api/v1/runs/missing-output-acceptance-run/outputs")[0] == 404
     print(
-        "PASS per-op output states, explicitly exported JSON/null/scalars, unreadable values and complete event pagination",
+        "PASS per-op status, mounted IO output values, missing-file null and complete event pagination",
         flush=True,
     )
 

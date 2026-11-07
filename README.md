@@ -71,6 +71,7 @@ docker run --rm --name dagster-webhook \
 | `DAGSTER_READINESS_TIMEOUT` | `3` | readiness 上游检查超时，单位为秒 |
 | `DAGSTER_HEADERS_JSON` | `{}` | 上游 HTTP 请求头的字符串字典，可配置鉴权头 |
 | `DAGSTER_CA_BUNDLE` | 未配置 | 可选 CA bundle 文件路径，文件必须存在 |
+| `RUN_OUTPUT_STORAGE_ROOT` | `/opt/dagster/dagster_home/storage` | 输出文件读取根目录；应与事件里的绝对路径及挂载路径一致 |
 | `IDEMPOTENCY_DB_PATH` | `./data/idempotency.sqlite3` | 幂等记录的 SQLite 文件路径；容器默认位于 `/data` |
 | `IDEMPOTENCY_RETENTION_SECONDS` | `86400` | 已完成幂等记录的保留期，单位为秒 |
 | `IDEMPOTENCY_LEASE_SECONDS` | `30` | 处理请求的租约时间，过期后允许核对已有运行 |
@@ -275,7 +276,7 @@ curl --fail-with-body --get "http://localhost:8080/api/v1/runs/$RUN_ID/events" \
 
 精确 Job 筛选采用 Dagster 原生运行列表的 Repository 来源标签。缺少该来源标签的旧运行不会匹配 `job_id`，可改用 `job_name` 查询，再根据详情判断来源。
 
-详情提供运行状态、开始／结束时间、标签、父／根 Run ID、失败摘要和来源字段 `job_id`、`repository_location_name`、`repository_name`；历史运行缺少来源时，这些来源字段可为 `null`。列表／详情不会默认返回整份运行配置。事件接口提供 Dagster 结构化事件，原始 stdout／stderr 的完整下载不在该接口契约中。运行 `SUCCESS` 也不表示网关能够直接返回任意 Python 业务输出，输出读取需依据资产元数据或业务约定。
+详情提供运行状态、开始／结束时间、标签、父／根 Run ID、失败摘要和来源字段 `job_id`、`repository_location_name`、`repository_name`；历史运行缺少来源时，这些来源字段可为 `null`。列表／详情不会默认返回整份运行配置。事件接口提供 Dagster 结构化事件，原始 stdout／stderr 的完整下载不在该接口契约中。输出查询可读取挂载目录中 IO Manager 保存的 JSON 兼容结果；无法读取的输出值为 `null`。
 
 ### 各 op 的输出和状态
 
@@ -285,55 +286,48 @@ curl --fail-with-body \
   -H "Authorization: Bearer $APP_API_TOKEN"
 ```
 
-此接口需要 `read` 权限，只读取已有 Run。返回 `run_status` 和 `items`；每项包含 `step_key`、`op_handle`、步骤状态、UTC 开始／结束时间、重试尝试、声明输出名以及逐次输出事件。执行中、失败、跳过及计划中未启动的步骤均可查询。未启动状态为网关提供的 `NOT_STARTED`；取消整个 Run 不会被直接解释为所有步骤都已取消。
+需要 `read` 权限，查询已有 Run。保留 Run 和各步骤的状态，输出项只有 `output_name`、`output_value`：
 
-一个 op 的动态执行实例可有不同 `step_key`，但共享 `op_handle`。未解析的动态模板通过 `kind` 区分。历史 Run 如果缺少执行计划，`execution_plan_available=false`，无法补齐既无步骤统计也无事件的未启动 op。
-
-`outputs` 独立保留 `STEP_OUTPUT` 和 `HANDLED_OUTPUT`：前者表示产生输出及类型检查，后者表示 IO Manager 处理输出。同名输出可能因为重试或动态输出多次出现，不按名称覆盖，也不自动合并两个事件的元数据。Dagster 1.13.26 GraphQL 没有提供动态输出的 `mapping_key`，所以接口保留各个事件，但不能可靠补出动态输出项的映射键。
-
-实际值与输出元数据分开表达：
-
-| 字段 | 含义 |
-| --- | --- |
-| `value_available=true` | 已读取业务明确导出的实际值；此时 `value=null` 表示实际结果就是 `null` |
-| `value_available=false` | 检查 `value_unavailable_reason`，不能把 `value=null` 当作实际输出 |
-| `value_source` | 用于读取值的元数据标签，默认是 `api_value` |
-| `metadata` | 事件的元数据预览，包括原生类型、标签和值；普通元数据不自动等于实际返回值 |
-
-普通 `return`／`Out` 的实际对象由 IO Manager 保存，可能位于内存、文件或数据库中。网关没有对应 Job 的运行资源与通用对象读取入口，因此这一版仅从业务明确导出的输出元数据中读取 JSON 值，支持 JSON、Text、Int、Float、Bool 和 Null 类型。不会仅凭文件路径或 URL 读取内容，也不反序列化 pickle。已有 Run 若未导出结果，仍会返回可见的状态、输出事件和元数据，并标记 `NOT_EXPOSED`。
-
-业务 op 可以显式导出结果，例如：
-
-```python
-from dagster import MetadataValue, op
-
-
-@op
-def calculate(context):
-    result = {"total": 42, "items": ["a", "b"]}
-    context.add_output_metadata({"api_value": MetadataValue.json(result)})
-    return result
+```json
+{
+  "run_id": "example-run",
+  "run_status": "SUCCESS",
+  "items": [
+    {
+      "step_key": "gen_markdown",
+      "status": "SUCCESS",
+      "outputs": [
+        {"output_name": "title", "output_value": "今日通知"},
+        {"output_name": "markdown", "output_value": "## 今日通知\n处理完成。"}
+      ]
+    }
+  ],
+  "next_cursor": "opaque-dagster-event-cursor",
+  "has_more": false,
+  "complete": true
+}
 ```
 
-这里的 `result` 是字典；`MetadataValue.json` 用于字典、数组或 `None`。标量可直接导出为原生元数据，例如 `context.add_output_metadata({"api_value": 0})`，也可使用 `MetadataValue.int`、`MetadataValue.bool`、`MetadataValue.text`。这样数字 `0`、布尔 `false` 和明确的 `null` 都能与“未读取到值”区分。
+接口读取 `HANDLED_OUTPUT` 中 `manager_key=io_manager` 且元数据标签为 `path` 的存储路径。没有路径、文件不存在、不可读取或结果无法转换为 JSON 时，`output_value` 统一为 `null`。本次从头扫描到尾时，尚无处理记录的声明输出补为 `null`；局部或增量扫描不补占位输出。实际结果为 `null` 时也返回 `null`。
 
-多输出 op 可以为每个 `Output` 添加相同约定标签的元数据，或在 `context.add_output_metadata` 中指定 `output_name`。接口根据事件的 `output_name` 分别返回。业务使用其他标签时，可通过 `?value_metadata_key=your_result_key` 指定；只有明确代表实际结果的元数据标签才应这样使用。
+同一次扫描内，相同输出名称及路径的重复记录取最后一次；同名动态输出保存到不同路径时分别保留。去重仅限本次扫描范围。
 
-不可读取原因包括：`NOT_EXPOSED`（没有明确导出）、`INVALID_VALUE`（类型不支持、不是合法有限 JSON 或嵌套超过 64 层）、`VALUE_TOO_LARGE`（单个实际值超过 64 KiB）、`RESPONSE_LIMIT`（本次实际值累计超过 1 MiB）。元数据预览单项最多约 4 KiB，另共享 1 MiB 预算；截断项有 `truncated=true`、`value_available=false`。这些是分别对实际值与元数据预览的预算，不是整份 HTTP 响应的大小上限。
+`STEP_OUTPUT` 在 IO Manager 保存结果前记录产生输出和类型检查；`HANDLED_OUTPUT` 在处理完成后记录，文件存储路径来自后者。因此此接口使用 `HANDLED_OUTPUT`，不再返回两种事件的重复信息；内存或自定义 IO Manager 仍可能没有文件路径。
 
-`RESPONSE_LIMIT` 的事件仍属于已扫描事件，游标不会为省略的值停留。需要重新读取这些值时，应从较早的游标减小 `max_events` 重读；`complete=true` 也不保证所有实际值可读，仍须逐项检查 `value_available`。
+网关需要挂载与 Dagster 相同的实际输出目录。保留幂等数据库的原有挂载，再增加输出存储挂载，例如：
 
-接口默认最多扫描 10000 个事件，可设置 `max_events=1..20000`；扫描数包含普通日志及非输出事件。达到上限时，使用 `next_cursor` 继续查询：
-
-```bash
-curl --fail-with-body --get \
-  "http://localhost:8080/api/v1/runs/$RUN_ID/outputs" \
-  -H "Authorization: Bearer $APP_API_TOKEN" \
-  --data-urlencode "cursor=$NEXT_CURSOR" \
-  --data-urlencode 'max_events=10000'
+```yaml
+services:
+  dagster-webhook:
+    image: sqkkyzx/dagster-webhook:1.13.26.7
+    volumes:
+      - ./data:/data
+      - ./storage/io-storage:/opt/dagster/dagster_home/storage:ro
 ```
 
-`has_more=true` 表示查询时仍有未扫描事件。`complete=true` 仅表示本次从事件开头扫描到了当前尾部，不表示 Run 已完成；传入 `cursor` 的增量响应为 `complete=false`。增量响应只包含本段的输出事件，而步骤状态仍是读取时的统计快照。即使到尾也可保留游标继续轮询。步骤统计与事件查询不是原子快照；本接口统一使用 UTC ISO 8601 时间，旧 `/events` 的原生毫秒时间戳保持兼容。
+默认读取根目录为 `/opt/dagster/dagster_home/storage`，通过 `RUN_OUTPUT_STORAGE_ROOT` 可设置其他读取根目录。事件路径必须位于这个目录中；挂载到相同容器路径即可使用，无需修改 Job 来导出元数据。支持 JSON 文件及保存 JSON 基础类型的 pickle，元组转换为数组；其他对象、超过 64 层的数据或无法读取的结果统一返回 `null`。单文件与单值上限均为 16 MiB，本次结果累计上限为 32 MiB，超限输出返回 `null`。
+
+接口默认最多扫描 10000 个事件，`max_events` 范围为 1–20000。`has_more=true` 时携带 `next_cursor` 继续读取；`complete=true` 表示本次从事件开头扫描到当前尾部，不表示 Run 已结束或所有文件均可读取。传入 `cursor` 时只处理本段输出，运行中查询的步骤状态与事件不是原子快照。
 
 ### 批量终止
 
@@ -397,7 +391,7 @@ curl --fail-with-body -X POST http://localhost:8080/api/v1/submit_job \
 
 ## 版本、测试与发布
 
-版本格式为 `<Dagster 主版本.次版本.补丁版本>.<私有修订号>`。`1.13.26.6` 表示依赖 Dagster `1.13.26` 的第 6 个网关修订。升级 Dagster 时同步更新前三段，仅修改网关时递增最后一段。HTTP API 的 `/api/v1` 契约与包版本独立演进。
+版本格式为 `<Dagster 主版本.次版本.补丁版本>.<私有修订号>`。`1.13.26.7` 表示依赖 Dagster `1.13.26` 的第 7 个网关修订。升级 Dagster 时同步更新前三段，仅修改网关时递增最后一段。HTTP API 的 `/api/v1` 契约与包版本独立演进。
 
 `pyproject.toml` 是网关版本的唯一来源，健康检查、OpenAPI 和 CI 发布使用相同版本。CI 校验版本与固定 Dagster 依赖的对应关系；已有版本标签属于其他提交时拒绝发布。
 

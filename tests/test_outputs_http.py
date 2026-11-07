@@ -1,4 +1,4 @@
-"""Output query HTTP contracts use only a mocked read adapter."""
+"""Simple output query HTTP contracts use only a mocked read adapter."""
 
 from unittest.mock import Mock
 
@@ -15,48 +15,13 @@ def outputs_adapter(app):
     adapter.get_run_outputs.return_value = {
         "run_id": "example-run",
         "run_status": "SUCCESS",
-        "execution_plan_available": True,
         "items": [
             {
                 "step_key": "example_op",
-                "op_handle": "example_op",
-                "kind": "COMPUTE",
                 "status": "SUCCESS",
-                "started_at": "2026-11-08T00:00:00Z",
-                "ended_at": "2026-11-08T00:00:01Z",
-                "attempts": [
-                    {
-                        "started_at": "2026-11-08T00:00:00Z",
-                        "ended_at": "2026-11-08T00:00:01Z",
-                    }
-                ],
-                "declared_outputs": ["result"],
-                "outputs": [
-                    {
-                        "event_type": "STEP_OUTPUT",
-                        "output_name": "result",
-                        "timestamp": "2026-11-08T00:00:00.500Z",
-                        "type_check_success": True,
-                        "manager_key": None,
-                        "metadata": [
-                            {
-                                "label": "api_value",
-                                "type": "JsonMetadataEntry",
-                                "description": None,
-                                "value": None,
-                                "value_available": True,
-                                "truncated": False,
-                            }
-                        ],
-                        "value_available": True,
-                        "value": None,
-                        "value_unavailable_reason": None,
-                        "value_source": "api_value",
-                    }
-                ],
+                "outputs": [{"output_name": "result", "output_value": None}],
             }
         ],
-        "scanned_events": 3,
         "next_cursor": "tail-cursor",
         "has_more": False,
         "complete": True,
@@ -72,19 +37,27 @@ def test_outputs_are_readable_with_read_scope_and_forward_query_parameters(
         gateway, "API_KEYS", (APIKey("reader", "output-reader", frozenset({"read"})),)
     )
     response = client.get(
-        "/api/v1/runs/example-run/outputs?cursor=old-cursor&max_events=8&value_metadata_key=exported",
+        "/api/v1/runs/example-run/outputs?cursor=old-cursor&max_events=8",
         headers={"Authorization": "Bearer output-reader"},
     )
     assert response.status_code == 200
     outputs_adapter.get_run_outputs.assert_called_once_with(
-        "example-run", cursor="old-cursor", max_events=8, value_metadata_key="exported"
+        "example-run", cursor="old-cursor", max_events=8
     )
     body = response.json()
-    output = body["items"][0]["outputs"][0]
-    assert output["value_available"] is True and output["value"] is None
-    assert output["metadata"][0]["value_available"] is True
-    assert body["items"][0]["status"] == "SUCCESS"
-    assert body["execution_plan_available"] is True
+    assert body["items"][0] == {
+        "step_key": "example_op",
+        "status": "SUCCESS",
+        "outputs": [{"output_name": "result", "output_value": None}],
+    }
+    assert set(body) == {
+        "run_id",
+        "run_status",
+        "items",
+        "next_cursor",
+        "has_more",
+        "complete",
+    }
     assert response.headers["X-Request-ID"]
 
 
@@ -106,14 +79,7 @@ def test_outputs_require_read_permission(client, outputs_adapter, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "query",
-    [
-        "max_events=0",
-        "max_events=20001",
-        "cursor=",
-        "value_metadata_key=",
-        "max_events=not-int",
-    ],
+    "query", ["max_events=0", "max_events=20001", "cursor=", "max_events=not-int"]
 )
 def test_invalid_output_query_is_rejected(client, outputs_adapter, auth_headers, query):
     response = client.get(
@@ -135,20 +101,26 @@ def test_missing_output_run_retains_standard_error_contract(
     assert response.json()["request_id"] == response.headers["X-Request-ID"]
 
 
-def test_output_openapi_explains_value_availability_and_partial_scans(client):
+def test_output_openapi_describes_mounted_files_and_simple_values(client):
     schema = client.get("/openapi.json").json()
     operation = schema["paths"]["/api/v1/runs/{run_id}/outputs"]["get"]
     assert operation["x-required-scopes"] == ["read"]
-    assert {"run_id", "cursor", "max_events", "value_metadata_key"} <= {
-        parameter["name"] for parameter in operation["parameters"]
-    }
-    assert "api_value" in operation["description"]
+    parameters = {parameter["name"] for parameter in operation["parameters"]}
+    assert {"run_id", "cursor", "max_events"} <= parameters
+    assert "value_metadata_key" not in parameters
+    assert "HANDLED_OUTPUT" in operation["description"]
+    assert "RUN_OUTPUT_STORAGE_ROOT" in operation["description"]
     assert "complete" in operation["description"]
+    output_model = schema["components"]["schemas"]["RunOutputValue"]
+    assert set(output_model["properties"]) == {"output_name", "output_value"}
     media = operation["responses"]["200"]["content"]["application/json"]
-    assert {"readable_value", "not_started", "failed_after_output", "partial"} <= media[
+    assert {"readable_value", "not_started", "unreadable_value", "partial"} <= media[
         "examples"
     ].keys()
     assert (
-        media["examples"]["not_started"]["value"]["items"][0]["status"] == "NOT_STARTED"
+        media["examples"]["unreadable_value"]["value"]["items"][0]["outputs"][0][
+            "output_value"
+        ]
+        is None
     )
     assert media["examples"]["partial"]["value"]["complete"] is False

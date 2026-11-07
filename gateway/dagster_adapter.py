@@ -583,14 +583,12 @@ class DagsterAdapter:
         *,
         cursor=None,
         max_events=10000,
-        value_metadata_key="api_value",
     ) -> dict:
         return collect_run_outputs(
             self._execute,
             run_id,
             cursor=cursor,
             max_events=max_events,
-            value_metadata_key=value_metadata_key,
         )
 
     def submit_legacy_job(self, payload: dict) -> str:

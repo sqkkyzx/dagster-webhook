@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.dagster
+    volumes:
+      - dagster-storage:/opt/dagster/home/storage
     networks: [acceptance]
   proxy:
     build:
@@ -19,11 +21,14 @@ services:
       DAGSTER_READINESS_TIMEOUT: "1"
       IDEMPOTENCY_DB_PATH: /data/idempotency.sqlite3
       IDEMPOTENCY_LEASE_SECONDS: "2"
+      RUN_OUTPUT_STORAGE_ROOT: /opt/dagster/home/storage
     volumes:
       - gateway-data:/data
+      - dagster-storage:/opt/dagster/home/storage:ro
     networks: [acceptance]
 volumes:
   gateway-data:
+  dagster-storage:
 networks:
   acceptance:
     internal: true

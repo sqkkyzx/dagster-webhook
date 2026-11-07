@@ -108,9 +108,9 @@ Dagster 错误响应包含 `message`、`detail` 和 `error_type`。
 `idempotency_key` 提供，至少一处必填；两处相同可以接受，不同则返回 `422`。
 Key 的传递位置不影响任务指纹，切换 Header 和 Body 后仍可重放原请求。
 幂等接口首次创建返回 `201`，已接受请求重放返回 `200`；缺少 Key 不会降级为非幂等提交。
-`GET /api/v1/runs/{{run_id}}/outputs` 查询各 op 执行步骤的状态、输出事件及元数据。
-通过输出元数据 `api_value` 明确导出的 JSON 值可以返回；无法读取的值提供原因，
-不会将普通元数据、文件路径或对象存储地址当作实际返回值。
+`GET /api/v1/runs/{{run_id}}/outputs` 查询各 op 执行步骤的状态和输出值。
+根据 `HANDLED_OUTPUT` 的 `io_manager` 文件路径读取已挂载的输出。
+每个输出只返回 `output_name`、`output_value`；无文件或不可读取时返回 null。
 `409` 的结果不确定状态必须继续使用相同 Key 查询，不能换 Key 盲目重提。
 原有 `POST /api/v1/submit_job` 按 Job 名称非幂等提交，成功仍返回 `200`。
 提交接口均需要 `submit` 权限；非幂等请求超时后应先核查 Dagster，重试可能重复创建任务。
@@ -127,7 +127,10 @@ Key 的传递位置不影响任务指纹，切换 Header 和 Body 后仍可重�
     openapi_tags=[
         {"name": "Monitoring", "description": "网关自身的存活状态与版本信息。"},
         {"name": "Jobs", "description": "向 Dagster 提交 Job 执行请求。"},
-        {"name": "Runs", "description": "提交和查询运行，读取各 op 状态及已导出的输出，发送单个或批量终止请求。"},
+        {
+            "name": "Runs",
+            "description": "提交和查询运行，读取各 op 状态及已导出的输出，发送单个或批量终止请求。",
+        },
         {
             "name": "Submissions",
             "description": "查询本调用方的持久化提交记录，核对结果不确定的请求；不会重新创建 Run。",
@@ -1000,6 +1003,39 @@ for route in [*app.routes, *discovery_router.routes, *operations_router.routes]:
 
 app.include_router(discovery_router)
 app.include_router(operations_router)
+
+
+_default_openapi = app.openapi
+
+
+def gateway_openapi():
+    """Preserve explicit JSON nulls in response examples shown by ReDoc."""
+    if app.openapi_schema is not None:
+        return app.openapi_schema
+    schema = _default_openapi()
+    for route in [*app.routes, *discovery_router.routes, *operations_router.routes]:
+        if not isinstance(route, APIRoute):
+            continue
+        for method in route.methods:
+            operation = (
+                schema.get("paths", {}).get(route.path_format, {}).get(method.lower())
+            )
+            if not operation:
+                continue
+            for code, response in route.responses.items():
+                target = operation.get("responses", {}).get(str(code), {})
+                for media_type, media in response.get("content", {}).items():
+                    content = target.get("content", {}).get(media_type)
+                    if content is not None:
+                        for name in ("example", "examples"):
+                            if name in media:
+                                content[name] = jsonable_encoder(
+                                    media[name], exclude_none=False
+                                )
+    return schema
+
+
+app.openapi = gateway_openapi
 
 
 if __name__ == "__main__":

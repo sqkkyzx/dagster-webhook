@@ -6,6 +6,10 @@
 不向宿主发布端口，HTTP 检查通过 `docker compose exec` 在代理容器内访问测试
 服务。两种模式都会在结束时清理自己创建的资源。
 
+输出测试中，Dagster 将默认 IO Manager 的文件写入独立存储目录；Docker 模式把
+同一个命名卷只读挂载给网关，原生模式让网关读取本次临时目录。不会挂载业务
+输出目录，也不要求 op 添加结果元数据。
+
 ## 成品镜像验收
 
 需要 Docker Engine 和 Docker Compose v2。先构建应用镜像，再运行：
@@ -42,8 +46,9 @@ uv pip install --python /tmp/dagster-gateway-acceptance/bin/python . dagster-web
   两处冲突或均未提供返回 422，且不向 Dagster 发送创建请求。
 - 来源与提交关联保留标签在发往上游之前被拒绝。
 - 同 Key 并发提交仅发送一次 launch mutation，运行列表和事件可读取。
-- 查询每个 op 执行步骤的状态及所有输出事件，验证明确导出的 JSON、null、0 和 false
-  值，以及没有导出的值明确标记为不可读取；小页游标遍历完整覆盖输出事件。
+- 查询每个 op 的状态与简化的 `output_name`、`output_value`，从挂载的默认 IO Manager
+  文件读取字典、null、0、false、字符串及没有导出元数据的值；移除测试文件后返回 null。
+  小页游标遍历覆盖输出，不返回重复的 STEP_OUTPUT 详情。
 - 网关重启后使用持久化记录返回相同 Run。
 - 代理在 Dagster 确认接受后丢弃 launch 响应，验证 UNKNOWN、submission 查询、
   重启、显式核对和同 Key 重放；代理统计确认没有第二次 launch。

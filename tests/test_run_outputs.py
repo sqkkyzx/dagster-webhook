@@ -1,6 +1,6 @@
-"""Output-value and history contracts use the pinned remote GraphQL shapes."""
+"""Handled outputs are read from mounted storage and have a minimal contract."""
 
-import json
+import pickle
 from unittest.mock import Mock
 
 import pytest
@@ -10,7 +10,7 @@ from gateway import run_outputs
 from gateway.dagster_adapter import DagsterAdapter
 
 
-def run_result(plan=True, stats=True):
+def run_result(plan=True):
     return {
         "runOrError": {
             "__typename": "Run",
@@ -20,9 +20,9 @@ def run_result(plan=True, stats=True):
                 "steps": [
                     {
                         "key": "export",
-                        "solidHandleID": "nested.export",
+                        "solidHandleID": "export",
                         "kind": "COMPUTE",
-                        "outputs": [{"name": "payload"}, {"name": "optional"}],
+                        "outputs": [{"name": "result"}, {"name": "optional"}],
                     },
                     {
                         "key": "waiting",
@@ -34,44 +34,41 @@ def run_result(plan=True, stats=True):
             }
             if plan
             else None,
-            "stepStats": [
-                {
-                    "stepKey": "export",
-                    "status": "SUCCESS",
-                    "startTime": 1,
-                    "endTime": 3,
-                    "attempts": [
-                        {"startTime": 1, "endTime": 2},
-                        {"startTime": 2, "endTime": 3},
-                    ],
-                }
-            ]
-            if stats
-            else [],
+            "stepStats": [{"stepKey": "export", "status": "SUCCESS"}],
         }
     }
 
 
-def metadata(kind="JsonMetadataEntry", label="api_value", **value):
-    return {"__typename": kind, "label": label, "description": None, **value}
-
-
-def output(
-    *entries, kind="ExecutionStepOutputEvent", step="export", timestamp="2000", **extra
+def handled(
+    path=None,
+    *,
+    name="result",
+    manager="io_manager",
+    step="export",
+    kind="PathMetadataEntry",
 ):
+    entries = (
+        []
+        if path is None
+        else [
+            {
+                "label": "path",
+                "__typename": kind,
+                "path" if kind == "PathMetadataEntry" else "text": str(path),
+            }
+        ]
+    )
     return {
-        "__typename": kind,
+        "__typename": "HandledOutputEvent",
         "stepKey": step,
-        "solidHandleID": "nested.export",
-        "timestamp": timestamp,
-        "outputName": "payload",
-        "typeCheck": {"success": True},
-        "metadataEntries": list(entries),
-        **extra,
+        "solidHandleID": step,
+        "outputName": name,
+        "managerKey": manager,
+        "metadataEntries": entries,
     }
 
 
-def page(events, cursor="tail", more=False):
+def page(events, cursor="end", more=False):
     return {
         "logsForRun": {
             "__typename": "EventConnection",
@@ -91,250 +88,246 @@ def query(events, *, run=None, **options):
     return DagsterAdapter(client).get_run_outputs("run-id", **options), client
 
 
-def event_result(response, index=0):
-    return response["items"][0]["outputs"][index]
+def stored(tmp_path, monkeypatch, name, value):
+    monkeypatch.setenv("RUN_OUTPUT_STORAGE_ROOT", str(tmp_path))
+    target = tmp_path / name
+    target.write_bytes(pickle.dumps(value))
+    return target
 
 
-def test_plan_stats_and_output_history_are_preserved_without_inventing_values():
-    response, client = query(
-        [
-            output(metadata(jsonString='{"count":3}')),
-            output(
-                metadata("PathMetadataEntry", label="path", path="/data/result"),
-                kind="HandledOutputEvent",
-                managerKey="io_manager",
-            ),
-            output(metadata(jsonString='{"count":4}'), timestamp="3000"),
-        ]
-    )
-    assert response["run_status"] == "SUCCESS"
-    assert response["execution_plan_available"] is True
-    assert response["complete"] is True and response["has_more"] is False
-    assert response["scanned_events"] == 3
-    step = response["items"][0]
-    assert step["op_handle"] == "nested.export"
+def test_simple_contract_reads_handled_file_and_keeps_step_states(
+    tmp_path, monkeypatch
+):
+    path = stored(tmp_path, monkeypatch, "result", {"rows": [1, False, None]})
+    result, _ = query([handled(path)])
+    assert set(result) == {
+        "run_id",
+        "run_status",
+        "items",
+        "next_cursor",
+        "has_more",
+        "complete",
+    }
+    assert result["run_status"] == "SUCCESS" and result["complete"] is True
+    step = result["items"][0]
+    assert set(step) == {"step_key", "status", "outputs"}
     assert step["status"] == "SUCCESS"
-    assert step["declared_outputs"] == ["payload", "optional"]
-    assert len(step["attempts"]) == 2
-    assert [entry["event_type"] for entry in step["outputs"]] == [
-        "STEP_OUTPUT",
-        "HANDLED_OUTPUT",
-        "STEP_OUTPUT",
+    assert step["outputs"] == [
+        {"output_name": "result", "output_value": {"rows": [1, False, None]}},
+        {"output_name": "optional", "output_value": None},
     ]
-    assert event_result(response)["value"] == {"count": 3}
-    assert event_result(response, 1)["value_unavailable_reason"] == "NOT_EXPOSED"
-    assert event_result(response, 1)["manager_key"] == "io_manager"
-    assert event_result(response, 2)["value"] == {"count": 4}
-    assert response["items"][1]["status"] == "NOT_STARTED"
-    assert client._execute.call_count == 2
+    assert result["items"][1] == {
+        "step_key": "waiting",
+        "status": "NOT_STARTED",
+        "outputs": [{"output_name": "result", "output_value": None}],
+    }
 
 
 @pytest.mark.parametrize(
-    "entry,expected",
-    [
-        (
-            metadata(jsonString='{"nested":[0,false,null]}'),
-            {"nested": [0, False, None]},
-        ),
-        (metadata(jsonString="null"), None),
-        (metadata("NullMetadataEntry"), None),
-        (metadata("TextMetadataEntry", text=""), ""),
-        (metadata("IntMetadataEntry", intValue=0, intRepr="0"), 0),
-        (metadata("IntMetadataEntry", intValue=None, intRepr=str(2**70)), 2**70),
-        (metadata("FloatMetadataEntry", floatValue=0, floatRepr="0.0"), 0.0),
-        (metadata("BoolMetadataEntry", boolValue=False), False),
-    ],
+    "value", [None, False, 0, "", "markdown\n# title", [1, 2], {"ok": True}]
 )
-def test_actual_scalar_and_json_values_do_not_lose_null_false_or_zero(entry, expected):
-    response, _ = query([output(entry)])
-    found = event_result(response)
-    assert found["value_available"] is True
-    assert found["value"] == expected
-    assert found["value_source"] == "api_value"
-    assert found["value_unavailable_reason"] is None
-    assert found["metadata"][0]["value_available"] is True
+def test_real_pickle_values_are_not_lost_by_truthiness(tmp_path, monkeypatch, value):
+    path = stored(tmp_path, monkeypatch, "result", value)
+    result, _ = query([handled(path)])
+    found = result["items"][0]["outputs"][0]
+    assert set(found) == {"output_name", "output_value"}
+    assert found["output_value"] == value
+    assert type(found["output_value"]) is type(value)
+
+
+def test_step_output_is_ignored_even_with_exported_metadata(monkeypatch):
+    read = Mock(side_effect=AssertionError("STEP_OUTPUT must not read files"))
+    monkeypatch.setattr(run_outputs, "read_output_file", read)
+    event = {
+        "__typename": "ExecutionStepOutputEvent",
+        "stepKey": "export",
+        "outputName": "result",
+        "metadataEntries": [
+            {
+                "__typename": "JsonMetadataEntry",
+                "label": "api_value",
+                "jsonString": "123",
+            }
+        ],
+    }
+    result, _ = query([event])
+    assert result["items"][0]["outputs"][0] == {
+        "output_name": "result",
+        "output_value": None,
+    }
+    read.assert_not_called()
 
 
 @pytest.mark.parametrize(
-    "entry",
-    [
-        metadata(jsonString="NaN"),
-        metadata(jsonString="Infinity"),
-        metadata(jsonString="{"),
-        metadata("FloatMetadataEntry", floatValue=None, floatRepr="nan"),
-        metadata("FloatMetadataEntry", floatValue=None, floatRepr="inf"),
-        metadata("PathMetadataEntry", path="/secret/must-not-be-opened"),
-        metadata("UrlMetadataEntry", url="https://must-not-be-fetched.test/value"),
-        metadata("FutureMetadataEntry"),
-    ],
+    "event", [handled(), handled("/not-opened", manager="another_manager")]
 )
-def test_unsupported_or_invalid_values_are_explicitly_unavailable(entry):
-    response, client = query([output(entry)])
-    found = event_result(response)
-    assert found["value_available"] is False
-    assert found["value"] is None
-    assert found["value_unavailable_reason"] == "INVALID_VALUE"
-    assert client._execute.call_count == 2  # Only Run and event queries.
-    json.dumps(response, allow_nan=False)
+def test_missing_path_and_other_manager_return_null_without_read(monkeypatch, event):
+    read = Mock(side_effect=AssertionError("Must not read unsupported output"))
+    monkeypatch.setattr(run_outputs, "read_output_file", read)
+    result, _ = query([event])
+    assert result["items"][0]["outputs"][0]["output_value"] is None
+    read.assert_not_called()
 
 
-def test_custom_label_and_duplicate_labels_are_unambiguous():
-    event = output(metadata(label="custom", jsonString="[1,2]"))
-    response, _ = query([event])
-    assert event_result(response)["value_unavailable_reason"] == "NOT_EXPOSED"
-    response, _ = query([event], value_metadata_key="custom")
-    assert event_result(response)["value"] == [1, 2]
-    response, _ = query([output(metadata(jsonString="1"), metadata(jsonString="2"))])
-    assert event_result(response)["value_unavailable_reason"] == "INVALID_VALUE"
+def test_missing_file_is_null_and_text_path_metadata_is_supported(
+    tmp_path, monkeypatch
+):
+    path = stored(tmp_path, monkeypatch, "result", "actual text")
+    result, _ = query([handled(path, kind="TextMetadataEntry")])
+    assert result["items"][0]["outputs"][0]["output_value"] == "actual text"
+    path.unlink()
+    result, _ = query([handled(path)])
+    assert result["items"][0]["outputs"][0]["output_value"] is None
 
 
-def test_value_size_limit_and_text_preview_are_separate():
-    value = "x" * (run_outputs.MAX_VALUE_BYTES - 2)
-    response, _ = query([output(metadata("TextMetadataEntry", text=value))])
-    found = event_result(response)
-    assert found["value_available"] is True
-    preview = found["metadata"][0]
-    assert preview["truncated"] is True and preview["value_available"] is False
-    assert preview["value"]
-    assert (
-        len(json.dumps(preview["value"], ensure_ascii=False).encode())
-        <= run_outputs.METADATA_PREVIEW_BYTES
-    )
-    response, _ = query([output(metadata("TextMetadataEntry", text=value + "x"))])
-    assert event_result(response)["value_unavailable_reason"] == "VALUE_TOO_LARGE"
-
-
-def test_escaped_unicode_is_measured_after_json_decoding():
-    value = "中" * 12000
-    response, _ = query([output(metadata(jsonString=json.dumps(value)))])
-    assert event_result(response)["value_available"] is True
-    assert event_result(response)["value"] == value
-
-
-def test_deep_json_is_rejected_without_internal_error():
-    deep = "[" * 2000 + "0" + "]" * 2000
-    response, _ = query([output(metadata(jsonString=deep))])
-    assert event_result(response)["value_unavailable_reason"] == "INVALID_VALUE"
-
-
-def test_value_and_metadata_budgets_are_independent_and_explicit(monkeypatch):
-    monkeypatch.setattr(run_outputs, "VALUE_BUDGET_BYTES", 6)
-    monkeypatch.setattr(run_outputs, "METADATA_BUDGET_BYTES", 6)
-    response, _ = query(
-        [
-            output(metadata("TextMetadataEntry", text="abcd")),
-            output(metadata("NullMetadataEntry")),
-        ]
-    )
-    assert event_result(response)["value"] == "abcd"
-    second = event_result(response, 1)
-    assert second["value_unavailable_reason"] == "RESPONSE_LIMIT"
-    assert second["metadata"][0]["value"] is None
-    assert second["metadata"][0]["truncated"] is True
-
-
-def test_missing_execution_plan_uses_observed_steps_without_claiming_full_coverage():
-    response, _ = query(
-        [output(metadata(jsonString="null"))], run=run_result(plan=False)
-    )
-    assert response["execution_plan_available"] is False
-    assert len(response["items"]) == 1
-    assert response["items"][0]["op_handle"] == "nested.export"
-    assert response["items"][0]["declared_outputs"] == []
-
-
-def test_output_after_a_snapshot_with_no_stats_is_not_reported_not_started():
-    response, _ = query([output(metadata(jsonString="0"))], run=run_result(stats=False))
-    assert response["items"][0]["status"] == "UNKNOWN"
-    assert response["items"][1]["status"] == "NOT_STARTED"
-
-
-def test_dynamic_step_can_obtain_handle_from_non_output_events():
-    run = run_result(plan=False, stats=False)
-    run["runOrError"]["stepStats"] = [
-        {"stepKey": "mapped[a]", "status": "IN_PROGRESS", "attempts": []}
+def test_retry_same_path_reads_once_but_dynamic_paths_keep_same_names(
+    tmp_path, monkeypatch
+):
+    first = stored(tmp_path, monkeypatch, "first", "one")
+    second = stored(tmp_path, monkeypatch, "second", "two")
+    read = Mock(wraps=run_outputs.read_output_file)
+    monkeypatch.setattr(run_outputs, "read_output_file", read)
+    result, _ = query([handled(first), handled(first), handled(second)])
+    values = [
+        entry
+        for entry in result["items"][0]["outputs"]
+        if entry["output_name"] == "result"
     ]
-    response, _ = query(
-        [
-            {
-                "__typename": "ExecutionStepStartEvent",
-                "stepKey": "mapped[a]",
-                "solidHandleID": "nested.mapped",
-                "timestamp": "1000",
-            }
-        ],
-        run=run,
-    )
-    assert response["items"][0]["op_handle"] == "nested.mapped"
-    assert response["items"][0]["status"] == "IN_PROGRESS"
-    assert response["items"][0]["outputs"] == []
+    assert values == [
+        {"output_name": "result", "output_value": "one"},
+        {"output_name": "result", "output_value": "two"},
+    ]
+    assert read.call_count == 2
 
 
-def test_start_after_snapshot_without_stats_is_not_reported_not_started():
-    response, _ = query(
-        [
-            {
-                "__typename": "ExecutionStepStartEvent",
-                "stepKey": "export",
-                "solidHandleID": "nested.export",
-                "timestamp": "1000",
-            }
-        ],
-        run=run_result(stats=False),
-    )
-    assert response["items"][0]["status"] == "UNKNOWN"
-    assert response["items"][1]["status"] == "NOT_STARTED"
+def test_last_handling_replaces_previous_even_when_it_is_unreadable(
+    tmp_path, monkeypatch
+):
+    path = stored(tmp_path, monkeypatch, "result", "old")
+    result, _ = query([handled(path), handled(path, manager="unknown")])
+    assert result["items"][0]["outputs"][0]["output_value"] is None
 
 
-def test_paginated_scan_is_bounded_and_counts_non_output_events():
+def test_partial_and_incremental_pages_do_not_invent_missing_outputs(
+    tmp_path, monkeypatch
+):
+    path = stored(tmp_path, monkeypatch, "result", "value")
+    client = Mock()
+    client._execute.side_effect = [run_result(), page([handled(path)], "next", True)]
+    result = DagsterAdapter(client).get_run_outputs("run-id", max_events=1)
+    assert result["has_more"] is True and result["complete"] is False
+    assert result["items"][0]["outputs"] == [
+        {"output_name": "result", "output_value": "value"}
+    ]
+    assert result["items"][1]["outputs"] == []
+    result, _ = query([], cursor="next")
+    assert result["complete"] is False and not result["has_more"]
+    assert all(not item["outputs"] for item in result["items"])
+
+
+def test_reads_all_event_pages_and_counts_non_output_events(tmp_path, monkeypatch):
+    path = stored(tmp_path, monkeypatch, "result", 42)
     client = Mock()
     client._execute.side_effect = [
         run_result(),
-        page([{"__typename": "LogMessageEvent"}], "one", True),
-        page(
-            [output(metadata(jsonString="1")), output(metadata(jsonString="2"))],
-            "three",
-            True,
-        ),
+        page([{"__typename": "LogMessageEvent"}] * 1000, "first", True),
+        page([handled(path)], "last"),
     ]
-    response = DagsterAdapter(client).get_run_outputs("run-id", max_events=3)
-    assert response["scanned_events"] == 3
-    assert response["next_cursor"] == "three" and response["has_more"] is True
-    assert response["complete"] is False
+    result = DagsterAdapter(client).get_run_outputs("run-id", max_events=1001)
+    assert result["complete"] is True
+    assert result["items"][0]["outputs"][0]["output_value"] == 42
     assert [call.args[1]["limit"] for call in client._execute.call_args_list[1:]] == [
-        3,
-        2,
+        1000,
+        1,
     ]
-    response, _ = query([], cursor="three")
-    assert response["complete"] is False and response["has_more"] is False
+    assert client._execute.call_args_list[2].args[1]["cursor"] == "first"
 
 
 @pytest.mark.parametrize(
     "connection",
-    [page([], "same", True), page([{"__typename": "LogMessageEvent"}], "same", True)],
+    [
+        page([], more=True),
+        page([{"__typename": "LogMessageEvent"}], cursor=None, more=True),
+    ],
 )
-def test_nonadvancing_cursor_cannot_loop_forever(connection):
+def test_nonadvancing_event_cursor_does_not_loop(connection):
     client = Mock()
     client._execute.side_effect = [run_result(), connection]
-    with pytest.raises(DagsterGraphQLClientError, match="cursor did not advance"):
-        DagsterAdapter(client).get_run_outputs("run-id", cursor="same")
+    with pytest.raises(DagsterGraphQLClientError, match="cursor"):
+        DagsterAdapter(client).get_run_outputs("run-id")
 
 
-def test_missing_run_is_returned_before_querying_events():
+def test_missing_run_does_not_read_events_or_files(monkeypatch):
+    read = Mock()
+    monkeypatch.setattr(run_outputs, "read_output_file", read)
     client = Mock()
     client._execute.return_value = {
         "runOrError": {"__typename": "RunNotFoundError", "message": "missing"}
     }
     with pytest.raises(DagsterGraphQLClientError, match="RunNotFoundError"):
         DagsterAdapter(client).get_run_outputs("missing")
-    client._execute.assert_called_once()
+    assert client._execute.call_count == 1
+    read.assert_not_called()
 
 
-def test_failed_type_check_is_kept_with_output_evidence():
-    response, _ = query(
-        [output(metadata(jsonString="0"), typeCheck={"success": False})]
+def test_unknown_snapshot_status_and_missing_plan_are_not_fabricated():
+    run = run_result(plan=False)
+    run["runOrError"]["stepStats"][0]["status"] = None
+    result, _ = query([handled()], run=run)
+    assert result["items"][0]["status"] == "UNKNOWN"
+    assert len(result["items"]) == 1
+
+
+def test_observed_step_after_snapshot_is_unknown_not_not_started():
+    run = run_result()
+    run["runOrError"]["stepStats"] = []
+    result, _ = query(
+        [{"__typename": "ExecutionStepStartEvent", "stepKey": "export"}], run=run
     )
-    assert event_result(response)["type_check_success"] is False
-    assert (
-        event_result(response)["value_available"] is True
-    )  # Explicitly exported diagnostic value, not a successful op claim.
+    assert result["items"][0]["status"] == "UNKNOWN"
+    assert result["items"][1]["status"] == "NOT_STARTED"
+
+
+def test_concrete_dynamic_steps_replace_their_unresolved_template():
+    run = run_result()
+    run["runOrError"]["executionPlan"] = {
+        "steps": [
+            {
+                "key": "mapped[?]",
+                "solidHandleID": "mapped",
+                "kind": "UNRESOLVED_MAPPED",
+                "outputs": [{"name": "result"}],
+            }
+        ]
+    }
+    run["runOrError"]["stepStats"] = [{"stepKey": "mapped[a]", "status": "IN_PROGRESS"}]
+    result, _ = query(
+        [
+            {
+                "__typename": "ExecutionStepStartEvent",
+                "stepKey": "mapped[a]",
+                "solidHandleID": "mapped",
+            }
+        ],
+        run=run,
+    )
+    assert result["items"] == [
+        {
+            "step_key": "mapped[a]",
+            "status": "IN_PROGRESS",
+            "outputs": [{"output_name": "result", "output_value": None}],
+        }
+    ]
+
+
+def test_response_value_budget_stops_reading_more_files(tmp_path, monkeypatch):
+    path = stored(tmp_path, monkeypatch, "result", 0)
+    read = Mock(wraps=run_outputs.read_output_file)
+    monkeypatch.setattr(run_outputs, "read_output_file", read)
+    monkeypatch.setattr(run_outputs, "VALUE_BUDGET_BYTES", 1)
+    result, _ = query([handled(path), handled(path, name="second")])
+    assert result["items"][0]["outputs"][:2] == [
+        {"output_name": "result", "output_value": 0},
+        {"output_name": "second", "output_value": None},
+    ]
+    assert read.call_count == 1
