@@ -308,7 +308,7 @@ def test_batch_rejects_invalid_inputs(client, operation_adapter, auth_headers, p
     operation_adapter.terminate_runs.assert_not_called()
 
 
-def test_redoc_documents_required_key_and_create_replay_responses(client):
+def test_redoc_documents_alternative_keys_and_create_replay_responses(client):
     schema = client.get("/openapi.json").json()
     operation = schema["paths"]["/api/v1/runs"]["post"]
     key = next(
@@ -316,7 +316,8 @@ def test_redoc_documents_required_key_and_create_replay_responses(client):
         for parameter in operation["parameters"]
         if parameter["name"] == "Idempotency-Key"
     )
-    assert key["required"] is True
+    assert key["required"] is False
+    assert "二选一" in key["description"]
     assert key["description"]
     assert "200" in operation["responses"] and "201" in operation["responses"]
     assert (
@@ -665,3 +666,211 @@ def test_submission_marker_cannot_be_supplied_by_caller(
     operation_adapter.submit_run.assert_not_called()
     with sqlite3.connect(operation_store.path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM submissions").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("header_first", [True, False])
+def test_body_and_header_keys_replay_the_same_submission(
+    client, operation_adapter, operation_store, auth_headers, header_first
+):
+    header_request = {
+        "json": PAYLOAD,
+        "headers": {**auth_headers, "Idempotency-Key": "switch-key"},
+    }
+    body_request = {
+        "json": {**PAYLOAD, "idempotency_key": "switch-key"},
+        "headers": auth_headers,
+    }
+    first_request, replay_request = (
+        (header_request, body_request)
+        if header_first
+        else (body_request, header_request)
+    )
+    first = client.post("/api/v1/runs", **first_request)
+    replay = client.post("/api/v1/runs", **replay_request)
+    assert first.status_code == 201
+    assert replay.status_code == 200
+    assert replay.json()["run_id"] == first.json()["run_id"]
+    assert replay.json()["submission_id"] == first.json()["submission_id"]
+    operation_adapter.submit_run.assert_called_once()
+    assert "idempotency_key" not in operation_adapter.submit_run.call_args.args[0]
+
+
+def test_same_key_in_both_places_is_accepted_and_cross_source_payload_conflicts(
+    client, operation_adapter, operation_store, auth_headers
+):
+    headers = {**auth_headers, "Idempotency-Key": "same-key"}
+    first = client.post(
+        "/api/v1/runs", headers=headers, json={**PAYLOAD, "idempotency_key": "same-key"}
+    )
+    assert first.status_code == 201
+    replay = client.post(
+        "/api/v1/runs",
+        headers=auth_headers,
+        json={**PAYLOAD, "idempotency_key": "same-key"},
+    )
+    assert replay.status_code == 200
+    conflict = client.post(
+        "/api/v1/runs",
+        headers=auth_headers,
+        json={**PAYLOAD, "run_config": {}, "idempotency_key": "same-key"},
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["code"] == "IDEMPOTENCY_PAYLOAD_MISMATCH"
+    operation_adapter.submit_run.assert_called_once()
+
+
+def test_different_header_and_body_keys_are_rejected_before_claim(
+    client, operation_adapter, operation_store, auth_headers
+):
+    response = client.post(
+        "/api/v1/runs",
+        headers={**auth_headers, "Idempotency-Key": "header-key"},
+        json={**PAYLOAD, "idempotency_key": "body-key"},
+    )
+    assert response.status_code == 422
+    assert response.json()["code"] == "IDEMPOTENCY_KEY_MISMATCH"
+    operation_adapter.submit_run.assert_not_called()
+    with operation_store._connection() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM submissions").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    "key", ["", "with spaces", "slash/value", "k" * 201, 123, False, [], {}]
+)
+def test_invalid_body_key_is_not_hidden_by_valid_header(
+    client, operation_adapter, operation_store, auth_headers, key
+):
+    response = client.post(
+        "/api/v1/runs",
+        headers={**auth_headers, "Idempotency-Key": "valid-header"},
+        json={**PAYLOAD, "idempotency_key": key},
+    )
+    assert response.status_code == 422
+    assert response.json()["details"][0]["path"] == ["body", "idempotency_key"]
+    operation_adapter.submit_run.assert_not_called()
+
+
+@pytest.mark.parametrize("key", ["", "has spaces", "k" * 201])
+def test_invalid_header_key_is_not_hidden_by_valid_body(
+    client, operation_adapter, operation_store, auth_headers, key
+):
+    response = client.post(
+        "/api/v1/runs",
+        headers={**auth_headers, "Idempotency-Key": key},
+        json={**PAYLOAD, "idempotency_key": "valid-body"},
+    )
+    assert response.status_code == 422
+    operation_adapter.submit_run.assert_not_called()
+
+
+def test_null_body_key_uses_header_but_does_not_allow_missing_key(
+    client, operation_adapter, operation_store, auth_headers
+):
+    missing = client.post(
+        "/api/v1/runs", json={**PAYLOAD, "idempotency_key": None}, headers=auth_headers
+    )
+    assert missing.status_code == 422
+    assert operation_adapter.submit_run.call_count == 0
+    provided = client.post(
+        "/api/v1/runs",
+        json={**PAYLOAD, "idempotency_key": None},
+        headers={**auth_headers, "Idempotency-Key": "provided"},
+    )
+    assert provided.status_code == 201
+
+
+def test_old_payload_fingerprint_is_preserved_with_body_key(
+    client, operation_adapter, operation_store, auth_headers
+):
+    old_payload = {**PAYLOAD, "tags": {}, "op_selection": None, "asset_selection": None}
+    old_result = operation_store.submit(
+        "legacy",
+        "existing-event",
+        old_payload,
+        create=lambda marker: {"run_id": "existing-real-run", "status": "QUEUED"},
+        lookup=Mock(),
+    )
+    response = client.post(
+        "/api/v1/runs",
+        headers=auth_headers,
+        json={**PAYLOAD, "idempotency_key": "existing-event"},
+    )
+    assert response.status_code == 200
+    assert response.json()["run_id"] == "existing-real-run"
+    assert response.json()["submission_id"] == old_result.submission_id
+    operation_adapter.submit_run.assert_not_called()
+
+
+@pytest.mark.parametrize("include_key_header", [False, True])
+def test_direct_run_always_creates_and_has_no_store_dependency(
+    client, app, operation_adapter, auth_headers, include_key_header
+):
+    def unavailable_store():
+        raise AssertionError("Non-idempotent submission must not open its store")
+
+    app.dependency_overrides[gateway.get_idempotency_store] = unavailable_store
+    operation_adapter.submit_direct_run.side_effect = [
+        {"run_id": "first-direct-run", "status": "QUEUED"},
+        {"run_id": "second-direct-run", "status": "QUEUED"},
+    ]
+    headers = {
+        **auth_headers,
+        **(
+            {"Idempotency-Key": "ignored-for-direct-submit"}
+            if include_key_header
+            else {}
+        ),
+    }
+    responses = [
+        client.post("/api/v1/runs/submit", headers=headers, json=PAYLOAD)
+        for _ in range(2)
+    ]
+    assert [response.status_code for response in responses] == [201, 201]
+    assert responses[0].json()["run_id"] != responses[1].json()["run_id"]
+    for response in responses:
+        body = response.json()
+        assert set(body) == {"run_id", "status", "job_id", "status_url"}
+        assert response.headers["Location"] == body["status_url"]
+        assert "Idempotency-Replayed" not in response.headers
+    assert operation_adapter.submit_direct_run.call_count == 2
+    operation_adapter.submit_run.assert_not_called()
+
+
+def test_direct_submit_permissions_invalid_body_and_uncertain_transport(
+    client, operation_adapter, auth_headers, monkeypatch
+):
+    monkeypatch.setattr(
+        gateway, "API_KEYS", (APIKey("reader", "read-only", frozenset({"read"})),)
+    )
+    reader = client.post(
+        "/api/v1/runs/submit",
+        headers={"Authorization": "Bearer read-only"},
+        json=PAYLOAD,
+    )
+    assert reader.status_code == 403
+    invalid = client.post(
+        "/api/v1/runs/submit",
+        headers=auth_headers,
+        json={**PAYLOAD, "idempotency_key": "not-supported"},
+    )
+    assert invalid.status_code == 422
+    operation_adapter.submit_direct_run.assert_not_called()
+    operation_adapter.submit_direct_run.side_effect = DagsterGraphQLClientError(
+        "Connection timed out"
+    )
+    uncertain = client.post("/api/v1/runs/submit", headers=auth_headers, json=PAYLOAD)
+    assert uncertain.status_code == 502
+    assert uncertain.json()["retryable"] is False
+
+
+def test_direct_submit_is_documented_separately_from_idempotent_submit(client):
+    schema = client.get("/openapi.json").json()
+    operation = schema["paths"]["/api/v1/runs/submit"]["post"]
+    assert "非幂等" in operation["summary"]
+    assert operation["x-required-scopes"] == ["submit"]
+    assert "201" in operation["responses"]
+    assert "Location" in operation["responses"]["201"]["headers"]
+    assert (
+        "idempotency_key"
+        not in schema["components"]["schemas"]["RunSubmissionRequest"]["properties"]
+    )

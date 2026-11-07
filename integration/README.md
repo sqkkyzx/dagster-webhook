@@ -37,6 +37,9 @@ uv pip install --python /tmp/dagster-gateway-acceptance/bin/python . dagster-web
 - 健康、readiness、ReDoc/OpenAPI 版本、位置和 Job 发现。
 - 原生配置 Schema、正确/错误配置验证及结构化错误路径。
 - 旧提交指定不存在的 Repository 时明确拒绝，不自动改投其他 Repository。
+- 非幂等资源接口连续提交相同参数，创建两个不同 Run，且不注入提交恢复标记。
+- 幂等 Key 可从 Body 提供，并使用 Header 重放到同一 Run；两处相同可重放，
+  两处冲突或均未提供返回 422，且不向 Dagster 发送创建请求。
 - 来源与提交关联保留标签在发往上游之前被拒绝。
 - 同 Key 并发提交仅发送一次 launch mutation，运行列表和事件可读取。
 - 网关重启后使用持久化记录返回相同 Run。

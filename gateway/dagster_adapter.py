@@ -266,7 +266,7 @@ def _config_errors(errors: list[dict]) -> list[dict]:
             names = [error["fieldName"]]
         else:
             names = error.get("fieldNames", [])
-        for issue_path in ([path + [name] for name in names] if names else [path]):
+        for issue_path in [path + [name] for name in names] if names else [path]:
             normalized.append(
                 {
                     "message": error["message"],
@@ -512,7 +512,9 @@ class DagsterAdapter:
             self._execute(
                 RUNS_QUERY,
                 {
-                    "filter": {"tags": [{"key": SUBMISSION_TAG, "value": submission_id}]},
+                    "filter": {
+                        "tags": [{"key": SUBMISSION_TAG, "value": submission_id}]
+                    },
                     "cursor": None,
                     "limit": 2,
                 },
@@ -529,7 +531,9 @@ class DagsterAdapter:
                 "Multiple runs match this submission marker; the outcome remains unknown",
             )
         marker_values = [
-            tag["value"] for tag in records[0].get("tags", []) if tag["key"] == SUBMISSION_TAG
+            tag["value"]
+            for tag in records[0].get("tags", [])
+            if tag["key"] == SUBMISSION_TAG
         ]
         if marker_values != [submission_id]:
             raise DagsterGraphQLClientError(
@@ -580,6 +584,10 @@ class DagsterAdapter:
 
     def submit_run(self, payload: dict, submission_id: str) -> dict:
         return self._launch_run(payload, submission_id)
+
+    def submit_direct_run(self, payload: dict) -> dict:
+        """Create a fresh run without claiming or tagging an idempotent submission."""
+        return self._launch_run(payload, submission_id=None)
 
     def _launch_run(self, payload: dict, submission_id: str | None) -> dict:
         validate_submission_tags(payload.get("tags"))

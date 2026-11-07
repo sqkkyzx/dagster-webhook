@@ -13,7 +13,7 @@ class ErrorResponse(BaseModel):
     code: str = Field(description="稳定的网关错误码。", examples=["RESOURCE_NOT_FOUND"])
     request_id: str = Field(description="与 X-Request-ID 响应头一致的请求标识。")
     retryable: bool = Field(
-        description="能否按接口约定重试；提交重试必须使用相同幂等键。"
+        description="能否按接口约定重试；幂等提交重试必须使用相同幂等键。非幂等提交重试可能创建重复运行。"
     )
     details: list[dict[str, Any]] = Field(
         default_factory=list, description="结构化错误信息。"

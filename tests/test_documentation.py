@@ -40,7 +40,11 @@ def test_openapi_documents_security_responses_and_operations(client):
             assert operation["description"]
             assert operation["tags"]
             operation_ids.append(operation["operationId"])
-            assert "content" in operation["responses"]["200"]
+            assert any(
+                "content" in response
+                for code, response in operation["responses"].items()
+                if code in {"200", "201"}
+            )
             if path.startswith("/api/v1/"):
                 assert operation["security"]
                 assert "401" in operation["responses"]
@@ -77,7 +81,11 @@ def test_new_endpoints_document_required_scopes_and_idempotency(client):
         for parameter in creation["parameters"]
         if parameter["name"] == "Idempotency-Key"
     )
-    assert key["required"] is True
+    assert key["required"] is False
+    body = schema["components"]["schemas"]["IdempotentRunSubmissionRequest"]
+    assert "idempotency_key" in body["properties"]
+    assert "idempotency_key" not in body["required"]
+    assert "至少" in key["description"]
     for status in ("200", "201"):
         assert {"Location", "Idempotency-Replayed"} <= creation["responses"][status][
             "headers"

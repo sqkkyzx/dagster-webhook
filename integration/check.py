@@ -363,6 +363,59 @@ def check(environment):
         {"job_name": "acceptance_job", "repository_name": "absent_repository"},
     )
     assert status == 404, wrong_repository
+
+    direct_runs = []
+    direct_before = count_submissions()
+    for _ in range(2):
+        status, direct = api("/api/v1/runs/submit", "POST", payload)
+        assert status == 201, (status, direct)
+        assert direct["job_id"] == job["job_id"], direct
+        assert direct["status_url"] == "/api/v1/runs/" + direct["run_id"], direct
+        assert "submission_id" not in direct and "replayed" not in direct, direct
+        direct_runs.append(direct)
+    assert direct_runs[0]["run_id"] != direct_runs[1]["run_id"], direct_runs
+    assert count_submissions() == direct_before + 2
+    for direct in direct_runs:
+        wait_until(
+            lambda run_id=direct["run_id"]: run_status(run_id) == "SUCCESS",
+            "non-idempotent fixture completion",
+        )
+        status, detail = api(direct["status_url"])
+        assert (
+            status == 200 and "dagster-webhook/submission_id" not in detail["tags"]
+        ), detail
+    print(
+        "PASS non-idempotent submissions create two distinct runs without recovery markers",
+        flush=True,
+    )
+
+    optional_key_before = count_submissions()
+    body_payload = {**payload, "idempotency_key": "body-header-replay"}
+    status, body_created = api("/api/v1/runs", "POST", body_payload)
+    assert status == 201 and body_created["replayed"] is False, (status, body_created)
+    header_replayed = wait_until(
+        lambda: replay(payload, "body-header-replay"),
+        "header replay of body-key submission",
+    )
+    assert header_replayed["run_id"] == body_created["run_id"], header_replayed
+    status, both_replayed = api(
+        "/api/v1/runs", "POST", body_payload, "body-header-replay"
+    )
+    assert status == 200 and both_replayed["run_id"] == body_created["run_id"], (
+        both_replayed
+    )
+    assert count_submissions() == optional_key_before + 1
+    for invalid_payload, invalid_key in (
+        (payload, None),
+        ({**payload, "idempotency_key": "body-key"}, "different-header-key"),
+    ):
+        status, error = api("/api/v1/runs", "POST", invalid_payload, invalid_key)
+        assert status == 422 and count_submissions() == optional_key_before + 1, error
+    print(
+        "PASS body/header key alternatives, cross-source replay and conflicting/missing key rejection",
+        flush=True,
+    )
+
     before = count_submissions()
     for reserved in (".dagster/repository", "dagster-webhook/submission_id"):
         status, error = api(

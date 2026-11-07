@@ -113,7 +113,8 @@ export APP_API_KEYS_JSON='[
 | `GET` | `/api/v1/jobs/{job_id}` | 查询 Job 详情 |
 | `GET` | `/api/v1/jobs/{job_id}/config-schema` | 查询 Job 的配置类型和字段 |
 | `POST` | `/api/v1/jobs/{job_id}/validate` | 提交前校验配置和执行选择，不创建 Run |
-| `POST` | `/api/v1/runs` | 带幂等控制地创建 Run |
+| `POST` | `/api/v1/runs/submit` | 按 `job_id` 直接创建 Run，非幂等 |
+| `POST` | `/api/v1/runs` | 带幂等控制地创建 Run，Key 可放在 Header 或 Body |
 | `GET` | `/api/v1/runs` | 过滤、分页查询运行列表 |
 | `GET` | `/api/v1/runs/{run_id}` | 查询运行详情、时间和失败摘要 |
 | `GET` | `/api/v1/runs/{run_id}/events` | 按游标增量读取事件 |
@@ -146,7 +147,36 @@ curl --fail-with-body -X POST "http://localhost:8080/api/v1/jobs/$JOB_ID/validat
 
 配置错误的 `path` 从 Dagster 的验证栈转换：对象字段和 Map 键为字符串，数组下标为整数，例如 `["ops","extract","config","items",0,"count"]`。缺失或未知字段附加到所属对象路径，多字段错误逐项返回。根级错误的路径可以为空。提交时的配置错误通过 `details[].path` 使用同一规则。
 
+### 选择提交接口
+
+三个提交入口都需要 `submit` 权限（`admin` 或兼容的共享 Token 也可调用）：
+
+| 接口 | Job 选择方式 | 幂等语义 | 成功响应 |
+| --- | --- | --- | --- |
+| `POST /api/v1/runs/submit` | 发现接口返回的 `job_id` | 非幂等，每次成功请求创建新 Run | `201`，包含 `run_id`、状态和查询链接 |
+| `POST /api/v1/runs` | `job_id` | 按调用方和 Key 去重 | 首次 `201`，已接受请求重放 `200` |
+| `POST /api/v1/submit_job` | Job 名称、位置和 Repository | 非幂等，保留旧 RPC 契约 | `200`，包含 Run ID |
+
+### 非幂等提交
+
+使用资源接口直接提交时，不需要幂等键：
+
+```bash
+curl --fail-with-body -X POST http://localhost:8080/api/v1/runs/submit \
+  -H "Authorization: Bearer $APP_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "job_id":"<copy-from-jobs-response>",
+    "run_config":{},
+    "tags":{"source":"webhook"}
+  }'
+```
+
+成功返回 `201`，响应提供 `run_id`、提交时状态、`job_id` 和 `status_url`。此接口直接联系 Dagster，不创建本地幂等记录或提交恢复标记；相同请求调用两次会创建两个 Run。此入口忽略 `Idempotency-Key` Header，Body 不接受 `idempotency_key` 字段。若请求超时，Dagster 可能已经接收，必须先核查运行，自动重试可能重复执行。需要防止重复执行时，应使用下面的幂等接口。
+
 ### 幂等提交
+
+Key 可以放在 `Idempotency-Key` 请求头中：
 
 ```bash
 curl --fail-with-body -X POST http://localhost:8080/api/v1/runs \
@@ -160,11 +190,27 @@ curl --fail-with-body -X POST http://localhost:8080/api/v1/runs \
   }'
 ```
 
+也可以省略该请求头，在 JSON Body 的顶层提供 `idempotency_key`：
+
+```bash
+curl --fail-with-body -X POST http://localhost:8080/api/v1/runs \
+  -H "Authorization: Bearer $APP_API_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "job_id":"<copy-from-jobs-response>",
+    "idempotency_key":"source-event-20261108-001",
+    "run_config":{},
+    "tags":{"source":"webhook"}
+  }'
+```
+
+Header 和 Body 至少提供一处；两处均未提供返回 `422`，不会自动切换为非幂等提交。两处同时提供且值相同可以接受，值不同返回 `422 IDEMPOTENCY_KEY_MISMATCH`。Body 的 `null` 视为未提供；任一非 null 的已提供值都必须通过格式校验，不能用另一处合法值掩盖空字符串或非法格式。Key 的传递位置不参与任务参数指纹，也不会发送给 Dagster：使用 Header 提交后，改用相同 Body Key 和相同任务参数重试，仍返回同一个 Run。
+
 首次创建成功返回 `201`，重复请求命中已有结果返回 `200`。响应包含 Run 信息和重放标记；重放返回已记录的提交结果快照，不保证状态为最新值。Run 创建成功只表示已提交执行，最终成功或失败通过运行详情查询确认。
 
 新旧提交接口均禁止传入保留来源标签 `.dagster/repository` 和提交关联标签 `dagster-webhook/submission_id`，否则返回 `422`。来源标签由 Dagster 生成，提交关联标签由幂等接口注入；其他普通标签仍可使用。
 
-幂等键为必填请求头，长度为 1–200 个字符，仅允许字母、数字、点、下划线、冒号和短横线。键在同一调用方内生效：同键、同参数返回已有 Run；同键、不同参数返回 `409 IDEMPOTENCY_PAYLOAD_MISMATCH`。每次提交前先通过 SQLite 原子占位并持久化 `submission_id`，只允许占位成功的请求发送一次创建操作；远程请求期间不持有数据库事务锁。同键正在处理时返回 `409 IDEMPOTENCY_IN_PROGRESS` 和 `Retry-After`，等待后使用同键重试。
+幂等键长度为 1–200 个字符，仅允许字母、数字、点、下划线、冒号和短横线。键在同一调用方内生效：同键、同参数返回已有 Run；同键、不同参数返回 `409 IDEMPOTENCY_PAYLOAD_MISMATCH`。每次提交前先通过 SQLite 原子占位并持久化 `submission_id`，只允许占位成功的请求发送一次创建操作；远程请求期间不持有数据库事务锁。同键正在处理时返回 `409 IDEMPOTENCY_IN_PROGRESS` 和 `Retry-After`，等待后使用同键重试。
 
 Dagster 1.13.26 的 GraphQL 提交不支持客户端指定 Run ID。新接口将 `submission_id` 写入受保护标签 `dagster-webhook/submission_id`，并在成功响应后保存 Dagster 分配的真实 Run ID。标签只用于恢复关联，防止并发重复提交依赖本地原子占位。
 
@@ -245,14 +291,14 @@ curl --fail-with-body -X POST http://localhost:8080/api/v1/runs/terminate-batch 
 
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
-| `POST` | `/api/v1/submit_job` | 按 Job 名称提交，成功返回 `200` 和 Run ID |
+| `POST` | `/api/v1/submit_job` | 按 Job 名称非幂等提交，成功返回 `200` 和 Run ID |
 | `GET` | `/api/v1/get_run_status` | 通过查询参数 `run_id` 获取状态 |
 | `POST` | `/api/v1/terminate_run` | 终止单个运行 |
 | `POST` | `/api/v1/terminate_runs` | 原批量终止接口，部分成功仍返回 `409` |
 | `POST` | `/api/v1/reload_location` | 重载代码位置 |
 | `POST` | `/api/v1/shutdown_location` | 关闭代码位置；上游 SDK 已弃用该能力 |
 
-这些路径保留既有字段和主要成功响应。原 `submit_job` 不要求幂等键，每次成功调用均可创建新 Run；需要防止重复触发时使用新的 `/api/v1/runs` 接口。代码位置操作检查 SDK 的操作状态，上游返回失败时不会报告 `reloaded`／`shutdown` 成功。
+这些路径保留既有字段和主要成功响应。原 `submit_job` 不要求幂等键，每次成功调用均可创建新 Run；使用 `job_id` 的非幂等调用可选择 `/api/v1/runs/submit`，需要防止重复触发时使用 `/api/v1/runs`。代码位置操作检查 SDK 的操作状态，上游返回失败时不会报告 `reloaded`／`shutdown` 成功。
 
 原 RPC 提交示例：
 
@@ -292,7 +338,7 @@ curl --fail-with-body -X POST http://localhost:8080/api/v1/submit_job \
 
 ## 版本、测试与发布
 
-版本格式为 `<Dagster 主版本.次版本.补丁版本>.<私有修订号>`。`1.13.26.4` 表示依赖 Dagster `1.13.26` 的第 4 个网关修订。升级 Dagster 时同步更新前三段，仅修改网关时递增最后一段。HTTP API 的 `/api/v1` 契约与包版本独立演进。
+版本格式为 `<Dagster 主版本.次版本.补丁版本>.<私有修订号>`。`1.13.26.5` 表示依赖 Dagster `1.13.26` 的第 5 个网关修订。升级 Dagster 时同步更新前三段，仅修改网关时递增最后一段。HTTP API 的 `/api/v1` 契约与包版本独立演进。
 
 `pyproject.toml` 是网关版本的唯一来源，健康检查、OpenAPI 和 CI 发布使用相同版本。CI 校验版本与固定 Dagster 依赖的对应关系；已有版本标签属于其他提交时拒绝发布。
 

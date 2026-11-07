@@ -272,11 +272,36 @@ def test_legacy_submit_preserves_resolved_selector_and_sdk_tag_normalization():
     assert_graphql_variables_valid(*client._execute.call_args.args)
 
 
+def test_direct_run_does_not_inject_idempotent_submission_marker():
+    client = Mock()
+    client._execute.return_value = {
+        "launchRun": {
+            "__typename": "LaunchRunSuccess",
+            "run": run_record("direct-run", "QUEUED"),
+        }
+    }
+    result = DagsterAdapter(client).submit_direct_run(
+        {
+            "job_id": encode_job_id("l", "r", "j"),
+            "run_config": {},
+            "tags": {"source": "direct"},
+        }
+    )
+    params = client._execute.call_args.args[1]["params"]
+    assert params["executionMetadata"] == {
+        "tags": [{"key": "source", "value": "direct"}]
+    }
+    assert result["run_id"] == "direct-run"
+    assert_graphql_variables_valid(*client._execute.call_args.args)
+
+
 def test_submission_lookup_only_reads_the_exact_marker():
     client = Mock()
     record = run_record("actual-run", "QUEUED")
     record["tags"].append({"key": SUBMISSION_TAG, "value": "submission-id"})
-    client._execute.return_value = {"runsOrError": {"__typename": "Runs", "results": [record]}}
+    client._execute.return_value = {
+        "runsOrError": {"__typename": "Runs", "results": [record]}
+    }
     result = DagsterAdapter(client).find_submission_run("submission-id")
     assert result["run_id"] == "actual-run"
     document, variables = client._execute.call_args.args
@@ -291,7 +316,9 @@ def test_submission_lookup_only_reads_the_exact_marker():
 
 def test_submission_lookup_without_a_match_does_not_create_a_run():
     client = Mock()
-    client._execute.return_value = {"runsOrError": {"__typename": "Runs", "results": []}}
+    client._execute.return_value = {
+        "runsOrError": {"__typename": "Runs", "results": []}
+    }
     assert DagsterAdapter(client).find_submission_run("missing-marker") is None
     assert client._execute.call_count == 1
     assert "mutation" not in client._execute.call_args.args[0]
@@ -308,8 +335,12 @@ def test_submission_lookup_rejects_ambiguous_or_mismatched_results(kind):
         if kind == "wrong_marker":
             record["tags"].append({"key": SUBMISSION_TAG, "value": "other-marker"})
         records = [record]
-    client._execute.return_value = {"runsOrError": {"__typename": "Runs", "results": records}}
-    with pytest.raises(DagsterGraphQLClientError, match="SubmissionCorrelationConflict"):
+    client._execute.return_value = {
+        "runsOrError": {"__typename": "Runs", "results": records}
+    }
+    with pytest.raises(
+        DagsterGraphQLClientError, match="SubmissionCorrelationConflict"
+    ):
         DagsterAdapter(client).find_submission_run("submission-id")
 
 

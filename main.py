@@ -103,9 +103,14 @@ Dagster 错误响应包含 `message`、`detail` 和 `error_type`。
 
 ## 资源 API
 先通过 `/api/v1/jobs` 发现 Job 并取得复合 `job_id`，再获取配置 Schema 或执行只读验证。
-`POST /api/v1/runs` 要求 `Idempotency-Key`，首次创建返回 `201`，已接受请求重放返回 `200`。
+`POST /api/v1/runs/submit` 按 `job_id` 非幂等提交，每次成功请求创建新 Run，返回 `201`。
+`POST /api/v1/runs` 按调用方和 Key 去重，Key 可通过 `Idempotency-Key` 请求头或 Body 顶层
+`idempotency_key` 提供，至少一处必填；两处相同可以接受，不同则返回 `422`。
+Key 的传递位置不影响任务指纹，切换 Header 和 Body 后仍可重放原请求。
+幂等接口首次创建返回 `201`，已接受请求重放返回 `200`；缺少 Key 不会降级为非幂等提交。
 `409` 的结果不确定状态必须继续使用相同 Key 查询，不能换 Key 盲目重提。
-原有 RPC 路径继续可用，不提供幂等保证。
+原有 `POST /api/v1/submit_job` 按 Job 名称非幂等提交，成功仍返回 `200`。
+提交接口均需要 `submit` 权限；非幂等请求超时后应先核查 Dagster，重试可能重复创建任务。
 旧提交接口的 `repository_name` 省略或为 null 时，使用 `DAGSTER_REPOSITORY_NAME`
 配置的默认值（默认 `__repository__`）；请求中显式指定的名称优先。
 新资源接口的 `job_id` 始终携带实际 Repository，不受该默认值覆盖。
@@ -708,7 +713,7 @@ async def health_check():
 @app.post(
     "/api/v1/submit_job",
     response_model=RunActionResponse,
-    summary="提交 Job 执行",
+    summary="按 Job 名称提交（非幂等）",
     tags=["Jobs"],
     operation_id="submit_job",
     dependencies=[Depends(require_scope("submit"))],
@@ -718,7 +723,11 @@ async def health_check():
     ),
 )
 def submit_job(payload: SubmitJobRequest, client: ClientDependency):
-    """提交一次 Job 执行并返回 Run ID。存在多个同名 Job 时需指定代码位置。
+    """按 Job 名称非幂等提交一次执行，成功返回 200 和 Run ID。
+
+    不要求幂等键，每次成功调用都会创建新 Run。需要使用复合 job_id 直接提交时，
+    可选择 POST /api/v1/runs/submit；需要幂等控制时使用 POST /api/v1/runs。
+    存在多个同名 Job 时需指定代码位置。
 
     Repository 省略或为 null 时使用网关默认配置，默认名称为 __repository__。
     可以通过 DAGSTER_REPOSITORY_NAME 修改默认值，或在本次请求中覆盖 repository_name。

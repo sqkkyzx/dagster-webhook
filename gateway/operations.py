@@ -28,6 +28,12 @@ from gateway.validation import validate_submission_tags
 
 NonEmpty = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 AssetPath = Annotated[list[NonEmpty], Field(min_length=1)]
+IdempotencyKey = Annotated[
+    str,
+    StringConstraints(
+        strict=True, min_length=1, max_length=200, pattern=r"^[A-Za-z0-9._:-]+$"
+    ),
+]
 
 
 class RunSubmissionRequest(BaseModel):
@@ -79,6 +85,39 @@ class RunSubmissionRequest(BaseModel):
                 "run_config and tags must contain finite JSON values"
             ) from None
         return self
+
+
+class IdempotentRunSubmissionRequest(RunSubmissionRequest):
+    idempotency_key: IdempotencyKey | None = Field(
+        None,
+        description="调用方内唯一的幂等键，可替代 Header Idempotency-Key。Header 与 Body 至少提供一处；两处同值接受，不同返回 422。仅允许 1–200 个字母、数字、点、下划线、冒号和短横线；null 视为未提供，空字符串无效。",
+        examples=["daily-import-2026-11-08"],
+    )
+    model_config = ConfigDict(
+        json_schema_extra={
+            "examples": [
+                {
+                    "job_id": "WyJteV9jb2RlIiwibXlfcmVwb3NpdG9yeSIsImRhaWx5X2pvYiJd",
+                    "run_config": {},
+                },
+                {
+                    "job_id": "WyJteV9jb2RlIiwibXlfcmVwb3NpdG9yeSIsImRhaWx5X2pvYiJd",
+                    "run_config": {},
+                    "idempotency_key": "daily-import-2026-11-08",
+                },
+            ]
+        }
+    )
+
+
+class DirectRunResponse(BaseModel):
+    run_id: str = Field(description="Dagster 创建并返回的实际 Run ID。")
+    status: DagsterRunStatus = Field(
+        description="提交时的运行状态快照；实时状态通过 status_url 查询。",
+        examples=["QUEUED"],
+    )
+    job_id: str = Field(description="本次提交的复合 Job ID。")
+    status_url: str = Field(description="对应 Run 详情的相对链接，读取需要 read 权限。")
 
 
 class CreatedRunResponse(BaseModel):
@@ -281,6 +320,57 @@ DEFINITE_REJECTIONS = {
 def create_operations_router(get_adapter, get_store, require_submit, require_cancel):
     router = APIRouter(prefix="/api/v1")
 
+    direct_responses = responses(
+        "本次非幂等提交已被 Dagster 接受。每次成功调用创建新的 Run。",
+        {
+            "run_id": "example-run",
+            "status": "QUEUED",
+            "job_id": "example-job-id",
+            "status_url": "/api/v1/runs/example-run",
+        },
+        201,
+    )
+    direct_responses.pop(503)  # This route does not depend on submission storage.
+    direct_responses[201]["headers"] = {
+        "Location": {
+            "description": "对应 Run 详情的相对链接。",
+            "schema": {"type": "string"},
+        }
+    }
+
+    @router.post(
+        "/runs/submit",
+        status_code=201,
+        response_model=DirectRunResponse,
+        tags=["Runs"],
+        operation_id="submit_run_without_idempotency",
+        summary="直接提交 Run（非幂等）",
+        dependencies=[Depends(require_submit)],
+        responses=direct_responses,
+    )
+    def submit_run_direct(
+        payload: RunSubmissionRequest,
+        response: Response,
+        adapter: Annotated[Any, Depends(get_adapter)],
+    ):
+        """按复合 job_id 直接提交一次 Run，不要求幂等键或幂等数据库。
+
+        每次成功请求都会创建新的 Run，相同请求重复发送也会创建新运行。
+        此接口不读取 Idempotency-Key Header；Body 不接受 idempotency_key 字段。
+        需要防重时使用 POST /api/v1/runs，并从 Header 或 Body 提供幂等键。
+        成功返回 201、Run ID、状态快照和 Location/status_url；没有 submission_id 或重放标记。
+        超时或上游错误时任务可能已创建，返回错误不表示未执行；应先核查 Dagster 再决定重试。
+        此接口不生成可供 submission 查询/核对的持久化记录。
+        """
+        run = adapter.submit_direct_run(payload.model_dump())
+        response.headers["Location"] = f"/api/v1/runs/{run['run_id']}"
+        return {
+            "run_id": run["run_id"],
+            "status": run["status"],
+            "job_id": payload.job_id,
+            "status_url": f"/api/v1/runs/{run['run_id']}",
+        }
+
     @router.post(
         "/runs",
         status_code=201,
@@ -315,25 +405,26 @@ def create_operations_router(get_adapter, get_store, require_submit, require_can
         },
     )
     def create_run(
-        payload: RunSubmissionRequest,
+        payload: IdempotentRunSubmissionRequest,
         response: Response,
-        key: Annotated[
-            str,
-            Header(
-                alias="Idempotency-Key",
-                min_length=1,
-                max_length=200,
-                pattern=r"^[A-Za-z0-9._:-]+$",
-                description="调用方内唯一的请求键，只含字母、数字、点、下划线、冒号或短横线。",
-                examples=["daily-import-2026-11-08"],
-            ),
-        ],
         principal: Annotated[Any, Depends(require_submit)],
         adapter: Annotated[Any, Depends(get_adapter)],
         store: Annotated[Any, Depends(get_store)],
+        key: Annotated[
+            IdempotencyKey | None,
+            Header(
+                alias="Idempotency-Key",
+                description="调用方内唯一的请求键，可与 Body idempotency_key 二选一。至少提供一处；两处同值接受，不同返回 422。只含 1–200 个字母、数字、点、下划线、冒号或短横线。",
+                examples=["daily-import-2026-11-08"],
+            ),
+        ] = None,
     ):
         """同一调用方、相同 Key 和相同参数在保留期内只创建一个 Run。
 
+        从 Header Idempotency-Key 或 Body idempotency_key 提供幂等键，至少一处必填。
+        两处同值接受，不同返回 422 IDEMPOTENCY_KEY_MISMATCH；都没有时返回 422，不会降级为非幂等提交。
+        所有已提供的值均需符合格式约束；Body null 视为未提供，空字符串或非法字符会被拒绝。
+        Key 的传递位置不参与请求指纹，不会转发到 Dagster；同一请求可切换位置重试。
         首次创建返回 201；已接受请求重放返回 200。返回的 status 是快照，后续通过 status_url 查询。
         submission_url 可在不重传原配置的情况下查询本地提交状态；结果不确定时可按 submission_id 调用 reconcile 核对。
         Key 绑定的参数不同返回 409；处理中返回 409 和 Retry-After。
@@ -343,11 +434,38 @@ def create_operations_router(get_adapter, get_store, require_submit, require_can
         默认已接受/明确拒绝记录保留 24 小时，过期后相同 Key 可以创建新 Run；不确定记录不自动过期。
         SQLite 仅支持同机持久卷，不支持跨主机共享；存储路径需在容器重建后保留。
         """
-        if not key:
+        if key is None and payload.idempotency_key is None:
             raise GatewayHTTPError(
-                422, "REQUEST_VALIDATION_FAILED", "Idempotency-Key is required"
+                422,
+                "REQUEST_VALIDATION_FAILED",
+                "Provide Idempotency-Key in the header or idempotency_key in the body",
+                details=[
+                    {
+                        "path": ["body", "idempotency_key"],
+                        "message": "Provide a key here or in the Idempotency-Key header",
+                        "code": "missing",
+                    }
+                ],
             )
-        data = payload.model_dump()
+        if (
+            key is not None
+            and payload.idempotency_key is not None
+            and key != payload.idempotency_key
+        ):
+            raise GatewayHTTPError(
+                422,
+                "IDEMPOTENCY_KEY_MISMATCH",
+                "Header and body idempotency keys must match",
+                details=[
+                    {
+                        "path": ["body", "idempotency_key"],
+                        "message": "Must match the Idempotency-Key header",
+                        "code": "value_error",
+                    }
+                ],
+            )
+        key = key if key is not None else payload.idempotency_key
+        data = payload.model_dump(exclude={"idempotency_key"})
         # Reject a malformed composite identity before occupying a durable key.
         from gateway.dagster_adapter import decode_job_id
 
@@ -388,7 +506,7 @@ def create_operations_router(get_adapter, get_store, require_submit, require_can
                     {
                         "run_id": getattr(exc, "gateway_run_id", None),
                         "submission_id": getattr(exc, "gateway_submission_id", None),
-                        "resolution": "Retry with the same Idempotency-Key to check the existing run; do not create a new key",
+                        "resolution": "Retry with the same idempotency key in the header or body to check the existing run; do not create a new key",
                     }
                 ],
             ) from exc
