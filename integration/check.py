@@ -21,6 +21,7 @@ import time
 import tomllib
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,6 +79,9 @@ class Environment:
         )
         self.gateway_url = f"http://127.0.0.1:{self.gateway_port}"
         self.proxy_url = f"http://127.0.0.1:{self.proxy_port}"
+        if mode == "docker":
+            self.gateway_url = "http://gateway:8080"
+            self.proxy_url = "http://proxy:3001"
         self.token = secrets.token_hex(24)
         self.project = "dagster-acceptance-" + secrets.token_hex(6)
         self.processes, self.logs = {}, {}
@@ -88,15 +92,13 @@ class Environment:
             if not key.startswith(("DAGSTER_", "APP_", "IDEMPOTENCY_"))
         }
         self.env.update(
-            DAGSTER_ACCEPTANCE_GATEWAY_PORT=str(self.gateway_port),
-            DAGSTER_ACCEPTANCE_PROXY_PORT=str(self.proxy_port),
             DAGSTER_ACCEPTANCE_IMAGE=image or "unused-native-image",
             DAGSTER_ACCEPTANCE_TOKEN=self.token,
             NO_PROXY="127.0.0.1,localhost",
             no_proxy="127.0.0.1,localhost",
         )
 
-    def compose(self, *args):
+    def compose(self, *args, **kwargs):
         return subprocess.run(
             [
                 "docker",
@@ -110,7 +112,48 @@ class Environment:
             env=self.env,
             check=True,
             text=True,
+            **kwargs,
         )
+
+    def request(self, url, method="GET", payload=None, headers=None):
+        if self.mode != "docker":
+            return request(url, method, payload, headers)
+        parsed = urlsplit(url)
+        if parsed.hostname not in {"gateway", "proxy"}:
+            raise ValueError("Docker acceptance requests must target fixture services")
+        message = {
+            "service": parsed.hostname,
+            "path": parsed.path + ("?" + parsed.query if parsed.query else ""),
+            "method": method,
+            "payload": payload,
+            "headers": headers or {},
+        }
+        try:
+            result = self.compose(
+                "exec",
+                "-T",
+                "proxy",
+                "python",
+                "/fixture/http_probe.py",
+                input=json.dumps(message),
+                capture_output=True,
+                timeout=35,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            diagnostic = exc.stderr or ""
+            if isinstance(diagnostic, bytes):
+                diagnostic = diagnostic.decode(errors="replace")
+            raise URLError(
+                "Acceptance HTTP probe could not run in the proxy container: "
+                + diagnostic[-1500:]
+            ) from exc
+        try:
+            response = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Acceptance HTTP probe returned invalid JSON") from exc
+        if "transport_error" in response:
+            raise URLError(response["transport_error"])
+        return response["status"], response["body"]
 
     def spawn(self, name, args, extra_env):
         # The log remains open for this subprocess and is closed by stop_process.
@@ -175,7 +218,7 @@ class Environment:
             )
             self.start_gateway()
         wait_until(
-            lambda: request(self.gateway_url + "/ready")[0] == 200,
+            lambda: self.request(self.gateway_url + "/ready")[0] == 200,
             "isolated gateway and Dagster",
         )
 
@@ -201,12 +244,26 @@ class Environment:
             self.stop_process("gateway")
             self.start_gateway()
         wait_until(
-            lambda: request(self.gateway_url + "/ready")[0] == 200,
+            lambda: self.request(self.gateway_url + "/ready")[0] == 200,
             "gateway restart with retained idempotency storage",
         )
 
     def dump_logs(self):
         if self.mode == "docker":
+            self.compose("ps", "--all")
+            subprocess.run(
+                [
+                    "docker",
+                    "network",
+                    "inspect",
+                    self.project + "_acceptance",
+                    "--format",
+                    "internal={{.Internal}} containers={{json .Containers}}",
+                ],
+                env=self.env,
+                check=False,
+                text=True,
+            )
             self.compose("logs", "--no-color", "--tail", "100")
         else:
             for name in ("gateway", "dagster", "proxy"):
@@ -229,7 +286,7 @@ def check(environment):
     headers = {"Authorization": "Bearer " + environment.token}
 
     def api(path, method="GET", payload=None, key=None):
-        return request(
+        return environment.request(
             environment.gateway_url + path,
             method,
             payload,
@@ -237,7 +294,9 @@ def check(environment):
         )
 
     def count_submissions():
-        return request(environment.proxy_url + "/__acceptance/state")[1]["submissions"]
+        return environment.request(environment.proxy_url + "/__acceptance/state")[1][
+            "submissions"
+        ]
 
     def submit(payload, key):
         status, body = api("/api/v1/runs", "POST", payload, key)
@@ -346,7 +405,9 @@ def check(environment):
         "PASS concurrent submit, run/events queries and restart persistence", flush=True
     )
 
-    request(environment.proxy_url + "/__acceptance/drop-next-submit", "POST", {})
+    environment.request(
+        environment.proxy_url + "/__acceptance/drop-next-submit", "POST", {}
+    )
     status, uncertain = api("/api/v1/runs", "POST", payload, "lost-response")
     assert status == 409 and uncertain["code"] == "SUBMISSION_OUTCOME_UNKNOWN", (
         uncertain
@@ -376,7 +437,7 @@ def check(environment):
     )
     assert status == 200 and len(matching["items"]) == 1, matching
     assert matching["items"][0]["run_id"] == recovered["run_id"], matching
-    proxy_state = request(environment.proxy_url + "/__acceptance/state")[1]
+    proxy_state = environment.request(environment.proxy_url + "/__acceptance/state")[1]
     assert proxy_state["dropped"] == 1, proxy_state
     print(
         "PASS accepted-but-lost upstream response, reconciliation and no duplicate launch",
