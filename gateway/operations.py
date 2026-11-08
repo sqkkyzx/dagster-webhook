@@ -24,6 +24,7 @@ from gateway.idempotency import (
     StoredSubmissionRejection,
     SubmissionNotFound,
 )
+from gateway.job_resolution import resolve_job_reference
 from gateway.validation import validate_submission_tags
 
 NonEmpty = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
@@ -42,15 +43,26 @@ class RunSubmissionRequest(BaseModel):
         json_schema_extra={
             "examples": [
                 {
-                    "job_id": "WyJteV9jb2RlIiwibXlfcmVwb3NpdG9yeSIsImRhaWx5X2pvYiJd",
+                    "job_name": "daily_job",
                     "run_config": {},
                     "tags": {"source": "automation"},
                 }
             ]
         },
     )
-    job_id: NonEmpty = Field(
-        description="从 Job 发现接口取得的复合 ID，包含代码位置、Repository 和 Job 名称。"
+    job_name: NonEmpty = Field(
+        description="Dagster Job 名称。名称唯一时只需提供这一项。",
+        examples=["daily_job"],
+    )
+    repository_location_name: NonEmpty | None = Field(
+        None,
+        description="可选代码位置；省略时自动推断。存在同名 Job 时可提供此项缩小范围。",
+        examples=["my_code"],
+    )
+    repository_name: NonEmpty | None = Field(
+        None,
+        description="可选 Repository；省略时自动推断实际名称。只有按 Job 名称和位置仍不能唯一确定时才需提供。",
+        examples=["__repository__"],
     )
     run_config: dict[str, Any] = Field(
         default_factory=dict,
@@ -97,11 +109,11 @@ class IdempotentRunSubmissionRequest(RunSubmissionRequest):
         json_schema_extra={
             "examples": [
                 {
-                    "job_id": "WyJteV9jb2RlIiwibXlfcmVwb3NpdG9yeSIsImRhaWx5X2pvYiJd",
+                    "job_name": "daily_job",
                     "run_config": {},
                 },
                 {
-                    "job_id": "WyJteV9jb2RlIiwibXlfcmVwb3NpdG9yeSIsImRhaWx5X2pvYiJd",
+                    "job_name": "daily_job",
                     "run_config": {},
                     "idempotency_key": "daily-import-2026-11-08",
                 },
@@ -110,23 +122,33 @@ class IdempotentRunSubmissionRequest(RunSubmissionRequest):
     )
 
 
-class DirectRunResponse(BaseModel):
+class ResolvedJob(BaseModel):
+    job_name: str = Field(description="实际选择的 Job 名称。")
+    repository_location_name: str = Field(description="自动推断或显式指定的代码位置。")
+    repository_name: str = Field(description="自动推断或显式指定的 Repository。")
+
+
+class DirectRunResponse(ResolvedJob):
     run_id: str = Field(description="Dagster 创建并返回的实际 Run ID。")
     status: DagsterRunStatus = Field(
         description="提交时的运行状态快照；实时状态通过 status_url 查询。",
         examples=["QUEUED"],
     )
-    job_id: str = Field(description="本次提交的复合 Job ID。")
     status_url: str = Field(description="对应 Run 详情的相对链接，读取需要 read 权限。")
 
 
-class CreatedRunResponse(BaseModel):
+class CreatedRunResponse(ResolvedJob):
+    repository_location_name: str | None = Field(
+        None, description="实际代码位置；早期持久化快照可能缺失。"
+    )
+    repository_name: str | None = Field(
+        None, description="实际 Repository；早期持久化快照可能缺失。"
+    )
     run_id: str = Field(description="Dagster 创建并返回的实际 Run ID。")
     status: DagsterRunStatus = Field(
         description="提交或恢复确认时的状态快照；实时状态请查询 Run 详情。",
         examples=["QUEUED"],
     )
-    job_id: str = Field(description="本次请求的复合 Job ID。")
     submission_id: str = Field(description="持久化幂等记录的标识。")
     replayed: bool = Field(description="是否返回了同一幂等请求已接受的结果。")
     status_url: str = Field(description="相对于当前网关的 Run 详情链接。")
@@ -139,9 +161,6 @@ class SubmissionRunSnapshot(BaseModel):
     run_id: str = Field(description="Dagster Run ID。")
     status: DagsterRunStatus = Field(
         description="接受提交或恢复核对时的运行状态快照，不是实时状态。"
-    )
-    job_id: str | None = Field(
-        None, description="复合 Job ID；早期记录可能没有此字段。"
     )
     job_name: str | None = Field(None, description="Job 名称；早期记录可能为空。")
     repository_location_name: str | None = Field(None, description="Run 来源代码位置。")
@@ -239,11 +258,43 @@ def _lookup_submission_run(adapter, recovery_kind, token):
 
 
 def _submission_response(record):
+    record = dict(record)
+    if record.get("run"):
+        record["run"] = {**record["run"], **_job_fields(record["run"])}
     return {
         **record,
         "status_url": f"/api/v1/runs/{record['run_id']}" if record["run_id"] else None,
         "submission_url": f"/api/v1/submissions/{record['submission_id']}",
     }
+
+
+def _job_fields(run, fallback=None):
+    """Expose names, including safe snapshots saved by earlier gateway versions."""
+    names = {
+        key: run.get(key)
+        for key in ("job_name", "repository_location_name", "repository_name")
+    }
+    if isinstance(run.get("job_id"), str) and not all(names.values()):
+        from fastapi import HTTPException
+
+        from gateway.dagster_adapter import decode_job_id
+
+        try:
+            selector = decode_job_id(run["job_id"])
+        except HTTPException:
+            pass
+        else:
+            for key, source in (
+                ("job_name", "pipelineName"),
+                ("repository_location_name", "repositoryLocationName"),
+                ("repository_name", "repositoryName"),
+            ):
+                if names[key] is None:
+                    names[key] = selector[source]
+    for key, value in names.items():
+        if value is None and fallback is not None:
+            names[key] = fallback.get(key)
+    return names
 
 
 def _submission_error(exc):
@@ -325,7 +376,9 @@ def create_operations_router(get_adapter, get_store, require_submit, require_can
         {
             "run_id": "example-run",
             "status": "QUEUED",
-            "job_id": "example-job-id",
+            "job_name": "daily_job",
+            "repository_location_name": "my_code",
+            "repository_name": "__repository__",
             "status_url": "/api/v1/runs/example-run",
         },
         201,
@@ -353,8 +406,10 @@ def create_operations_router(get_adapter, get_store, require_submit, require_can
         response: Response,
         adapter: Annotated[Any, Depends(get_adapter)],
     ):
-        """按复合 job_id 直接提交一次 Run，不要求幂等键或幂等数据库。
+        """按 job_name 直接提交一次 Run，不要求幂等键或幂等数据库。
 
+        只需 Job 名称；repository_location_name、repository_name 均可省略或为 null，自动推断实际位置和 Repository。
+        可提供位置或 Repository 缩小范围；无匹配返回 404，多匹配返回 409 JOB_SELECTION_AMBIGUOUS 并列出候选，不创建 Run。
         每次成功请求都会创建新的 Run，相同请求重复发送也会创建新运行。
         此接口不读取 Idempotency-Key Header；Body 不接受 idempotency_key 字段。
         需要防重时使用 POST /api/v1/runs，并从 Header 或 Body 提供幂等键。
@@ -362,12 +417,18 @@ def create_operations_router(get_adapter, get_store, require_submit, require_can
         超时或上游错误时任务可能已创建，返回错误不表示未执行；应先核查 Dagster 再决定重试。
         此接口不生成可供 submission 查询/核对的持久化记录。
         """
-        run = adapter.submit_direct_run(payload.model_dump())
+        selected = resolve_job_reference(
+            adapter,
+            payload.job_name,
+            payload.repository_location_name,
+            payload.repository_name,
+        )
+        run = adapter.submit_direct_run({**payload.model_dump(), **selected})
         response.headers["Location"] = f"/api/v1/runs/{run['run_id']}"
         return {
             "run_id": run["run_id"],
             "status": run["status"],
-            "job_id": payload.job_id,
+            **_job_fields(selected),
             "status_url": f"/api/v1/runs/{run['run_id']}",
         }
 
@@ -384,7 +445,9 @@ def create_operations_router(get_adapter, get_store, require_submit, require_can
                 {
                     "run_id": "example-run",
                     "status": "QUEUED",
-                    "job_id": "example-job-id",
+                    "job_name": "daily_job",
+                    "repository_location_name": "my_code",
+                    "repository_name": "__repository__",
                     "submission_id": "example-submission",
                     "submission_url": "/api/v1/submissions/example-submission",
                     "replayed": False,
@@ -421,6 +484,10 @@ def create_operations_router(get_adapter, get_store, require_submit, require_can
     ):
         """同一调用方、相同 Key 和相同参数在保留期内只创建一个 Run。
 
+        只需 job_name；repository_location_name、repository_name 均非必填，省略或 null 时自动推断。
+        提供位置或 Repository 可缩小范围；无匹配返回 404，多匹配返回 409 JOB_SELECTION_AMBIGUOUS，并提供候选。
+        已接受请求重放不再发现 Job；上游不可达、Job 迁移或移除时仍返回原运行。
+        幂等参数包括原请求中选用的名称与可选位置/Repository，重试时应保持一致；省略与 null 等价。
         从 Header Idempotency-Key 或 Body idempotency_key 提供幂等键，至少一处必填。
         两处同值接受，不同返回 422 IDEMPOTENCY_KEY_MISMATCH；都没有时返回 422，不会降级为非幂等提交。
         所有已提供的值均需符合格式约束；Body null 视为未提供，空字符串或非法字符会被拒绝。
@@ -466,17 +533,30 @@ def create_operations_router(get_adapter, get_store, require_submit, require_can
             )
         key = key if key is not None else payload.idempotency_key
         data = payload.model_dump(exclude={"idempotency_key"})
-        # Reject a malformed composite identity before occupying a durable key.
-        from gateway.dagster_adapter import decode_job_id
+        selected = {}
 
-        decode_job_id(payload.job_id)
+        def prepare():
+            selected.update(
+                resolve_job_reference(
+                    adapter,
+                    payload.job_name,
+                    payload.repository_location_name,
+                    payload.repository_name,
+                )
+            )
+            return selected["job_id"]
+
+        def launch(token):
+            run = adapter.submit_run({**data, **selected}, token)
+            return {**run, **selected}
 
         try:
             result = store.submit(
                 principal.name,
                 key,
                 data,
-                create=lambda token: adapter.submit_run(data, token),
+                create=launch,
+                prepare=prepare,
                 lookup=lambda kind, token: _lookup_submission_run(adapter, kind, token),
                 is_rejection=lambda exc: (
                     isinstance(exc, DagsterGraphQLClientError)
@@ -493,6 +573,10 @@ def create_operations_router(get_adapter, get_store, require_submit, require_can
             rejection.gateway_submission_id = exc.submission_id
             raise rejection from exc
         except DagsterGraphQLClientError as exc:
+            if not selected:
+                # Discovery failed before any launch; retain normal upstream
+                # error classification rather than claiming an uncertain Run.
+                raise
             if exc.args and exc.args[0] in DEFINITE_REJECTIONS:
                 raise
             logging.getLogger("dagster_api_gateway").error(
@@ -542,7 +626,7 @@ def create_operations_router(get_adapter, get_store, require_submit, require_can
         return {
             "run_id": result.run["run_id"],
             "status": result.run["status"],
-            "job_id": payload.job_id,
+            **_job_fields(result.run, data),
             "submission_id": result.submission_id,
             "replayed": result.replayed,
             "status_url": f"/api/v1/runs/{result.run['run_id']}",

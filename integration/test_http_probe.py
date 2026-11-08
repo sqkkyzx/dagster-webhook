@@ -70,13 +70,13 @@ def test_probe_preserves_http_errors_json_and_document_html(fixture_http_server)
             "service": "gateway",
             "path": "/api/v1/runs",
             "method": "POST",
-            "payload": {"job_id": "fixture"},
+            "payload": {"job_name": "fixture"},
             "headers": {"Authorization": "Bearer fixture-token"},
         }
     ) == {
         "status": 201,
         "body": {
-            "payload": {"job_id": "fixture"},
+            "payload": {"job_name": "fixture"},
             "authorization": "Bearer fixture-token",
         },
     }

@@ -93,6 +93,7 @@ _STORED_RUN_FIELDS = frozenset(
         "root_run_id",
     }
 )
+_PENDING_JOB_RESOLUTION = "unresolved:job-name"
 
 
 class IdempotencyStore:
@@ -393,6 +394,11 @@ class IdempotencyStore:
                 pass
 
     def _check_existing(self, record, lookup) -> SubmissionResult | None:
+        # A name-based claim may still be discovering its target. A stale lease
+        # snapshot must never recover without the exact identity being bound.
+        if record.get("expected_job_id") == _PENDING_JOB_RESOLUTION:
+            self._preserve_unknown(record)
+            return None
         try:
             existing = lookup(record["recovery_kind"], record["run_id"])
         except Exception:  # noqa: BLE001 -- Any failed lookup leaves the outcome unknown.
@@ -517,6 +523,7 @@ class IdempotencyStore:
         create: Callable[[str], dict[str, Any]],
         lookup: Callable[[str, str], dict[str, Any] | None],
         is_rejection: Callable[[Exception], bool] | None = None,
+        prepare: Callable[[], str] | None = None,
     ) -> SubmissionResult:
         if not principal or not isinstance(principal, str):
             raise ValueError("A non-empty caller identity is required")
@@ -535,7 +542,7 @@ class IdempotencyStore:
             self._hash(principal),
             self._hash(key),
             self._hash(canonical),
-            payload.get("job_id"),
+            _PENDING_JOB_RESOLUTION if prepare is not None else payload.get("job_id"),
         )
         if not fresh:
             if record["state"] == "ACCEPTED":
@@ -558,6 +565,39 @@ class IdempotencyStore:
             return SubmissionResult(
                 run=accepted.run, replayed=True, submission_id=accepted.submission_id
             )
+        if prepare is not None:
+            # Resolve a name only for a new submission. Replays must not depend
+            # on the current workspace or accidentally switch to a moved Job.
+            try:
+                expected_job_id = prepare()
+                if not isinstance(expected_job_id, str) or not expected_job_id:
+                    raise ValueError("No resolved Job identity")
+                with self._connection() as connection:
+                    updated = connection.execute(
+                        """UPDATE submissions SET expected_job_id = ?
+                        WHERE submission_id = ? AND state IN ('REQUESTING', 'UNKNOWN')""",
+                        (expected_job_id, record["submission_id"]),
+                    )
+                    if updated.rowcount != 1:
+                        raise SubmissionUncertain(
+                            self._known_run_id(record), record["submission_id"]
+                        )
+                record["expected_job_id"] = expected_job_id
+            except Exception:
+                # No launch has been attempted. A failed read-only resolution
+                # can release its new claim; concurrent retries never launched.
+                try:
+                    with self._connection() as connection:
+                        connection.execute(
+                            """DELETE FROM submissions WHERE submission_id = ?
+                            AND state IN ('REQUESTING', 'UNKNOWN')""",
+                            (record["submission_id"],),
+                        )
+                except sqlite3.Error as cleanup_error:
+                    raise SubmissionUncertain(
+                        self._known_run_id(record), record["submission_id"]
+                    ) from cleanup_error
+                raise
         try:
             run = create(record["run_id"])
         except Exception as exception:

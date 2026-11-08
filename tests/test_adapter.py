@@ -12,6 +12,7 @@ from graphql import get_variable_values, parse, validate
 from gateway.dagster_adapter import (
     GRAPHQL_DOCUMENTS,
     DagsterAdapter,
+    build_runs_filter,
     decode_job_id,
     encode_job_id,
 )
@@ -193,6 +194,15 @@ def test_configuration_preflight_does_not_create_a_run(valid):
         encode_job_id("l", "r", "j"), {"ops": {}}, asset_selection=[["n", "a"]]
     )
     assert result["valid"] is valid
+    assert {
+        key: result[key]
+        for key in ("job_id", "job_name", "repository_location_name", "repository_name")
+    } == {
+        "job_id": encode_job_id("l", "r", "j"),
+        "job_name": "j",
+        "repository_location_name": "l",
+        "repository_name": "r",
+    }
     assert result["errors"] == (
         []
         if valid
@@ -207,6 +217,29 @@ def test_configuration_preflight_does_not_create_a_run(valid):
     document, variables = client._execute.call_args.args
     assert "mutation" not in document
     assert variables["selector"]["assetSelection"] == [{"path": ["n", "a"]}]
+
+
+def test_config_schema_exposes_human_readable_job_identity():
+    client = Mock()
+    client._execute.return_value = {
+        "runConfigSchemaOrError": {
+            "__typename": "RunConfigSchema",
+            "rootConfigType": {"key": "root"},
+            "allConfigTypes": [{"key": "root"}],
+            "rootDefaultYaml": "ops: {}",
+        }
+    }
+    job_id = encode_job_id("location", "custom", "daily_job")
+    assert DagsterAdapter(client).get_config_schema(job_id) == {
+        "job_id": job_id,
+        "job_name": "daily_job",
+        "repository_location_name": "location",
+        "repository_name": "custom",
+        "format": "dagster",
+        "root_type_key": "root",
+        "default_yaml": "ops: {}",
+        "types": [{"key": "root"}],
+    }
 
 
 def test_submit_correlates_submission_without_unsupported_run_id_input():
@@ -406,6 +439,173 @@ def test_exact_job_filter_uses_native_repository_label():
         {"key": ".dagster/repository", "value": "repo@first"},
     ]
     assert second["tags"] == [{"key": ".dagster/repository", "value": "repo@second"}]
+
+
+def test_named_repository_pair_uses_native_tag_without_mutating_caller_tags():
+    tags = {"source": "webhook"}
+    assert build_runs_filter(
+        job_name="same_job",
+        tags=tags,
+        repository_location_name=" location ",
+        repository_name=" custom ",
+    ) == {
+        "pipelineName": "same_job",
+        "tags": [
+            {"key": "source", "value": "webhook"},
+            {"key": ".dagster/repository", "value": "custom@location"},
+        ],
+    }
+    assert tags == {"source": "webhook"}
+
+
+@pytest.mark.parametrize(
+    "conditions",
+    [
+        {},
+        {"repository_location_name": "location"},
+        {"repository_name": "custom"},
+        {"repository_location_name": "location", "repository_name": "custom"},
+    ],
+)
+def test_history_filters_never_apply_the_configured_repository_default(
+    monkeypatch, conditions
+):
+    monkeypatch.setenv("DAGSTER_REPOSITORY_NAME", " ")
+    filters = build_runs_filter(job_name="daily_job", **conditions)
+    assert filters["pipelineName"] == "daily_job"
+    assert filters.get("tags", []) == (
+        [{"key": ".dagster/repository", "value": "custom@location"}]
+        if len(conditions) == 2
+        else []
+    )
+
+
+@pytest.mark.parametrize(
+    "filters",
+    [
+        {"repository_location_name": "other", "repository_name": "repo"},
+        {"repository_location_name": "first", "repository_name": "other"},
+    ],
+)
+def test_internal_job_id_rejects_a_conflicting_named_repository_pair(filters):
+    client = Mock()
+    with pytest.raises(HTTPException) as error:
+        DagsterAdapter(client).list_runs(
+            job_id=encode_job_id("first", "repo", "job"), **filters
+        )
+    assert error.value.status_code == 422
+    client._execute.assert_not_called()
+
+
+def test_named_repository_pair_rejects_a_conflicting_explicit_tag():
+    client = Mock()
+    with pytest.raises(HTTPException) as error:
+        DagsterAdapter(client).list_runs(
+            repository_location_name="location",
+            repository_name="custom",
+            tags={".dagster/repository": "another@location"},
+        )
+    assert error.value.status_code == 422
+    client._execute.assert_not_called()
+
+
+def originating_run(run_id, location="location", repository="custom"):
+    return {
+        **run_record(run_id),
+        "repositoryOrigin": {
+            "repositoryLocationName": location,
+            "repositoryName": repository,
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    "conditions",
+    [
+        {"repository_location_name": " location "},
+        {"repository_name": " custom "},
+    ],
+)
+def test_partial_history_filter_uses_origins_in_a_bounded_window(conditions):
+    client = Mock()
+    client._execute.return_value = {
+        "runsOrError": {
+            "__typename": "Runs",
+            "results": [
+                originating_run("matches"),
+                originating_run("unmatched", "other", "another"),
+                originating_run("lookahead"),
+            ],
+        }
+    }
+    adapter = DagsterAdapter(client)
+    adapter.list_jobs = Mock(
+        side_effect=AssertionError("history must not discover Jobs")
+    )
+    page = adapter.list_runs(job_name="job", limit=2, **conditions)
+    assert [item["run_id"] for item in page["items"]] == ["matches"]
+    assert page["next_cursor"] == "unmatched"
+    assert page["has_more"] is True
+    assert client._execute.call_count == 1
+    assert client._execute.call_args.args[1] == {
+        "filter": {"pipelineName": "job"},
+        "cursor": None,
+        "limit": 3,
+    }
+
+
+@pytest.mark.parametrize(
+    "conditions",
+    [
+        {"repository_location_name": "location"},
+        {"repository_name": "custom"},
+    ],
+)
+def test_partial_history_filter_advances_across_an_empty_page(conditions):
+    client = Mock()
+    first = originating_run("first", "other", "another")
+    second = run_record("old-run-without-origin")
+    third = originating_run("third")
+    client._execute.side_effect = [
+        {"runsOrError": {"__typename": "Runs", "results": [first, second, third]}},
+        {"runsOrError": {"__typename": "Runs", "results": [third]}},
+    ]
+    adapter = DagsterAdapter(client)
+    empty = adapter.list_runs(limit=2, **conditions)
+    assert empty == {
+        "items": [],
+        "next_cursor": "old-run-without-origin",
+        "has_more": True,
+    }
+    final = adapter.list_runs(cursor=empty["next_cursor"], limit=2, **conditions)
+    assert [item["run_id"] for item in final["items"]] == ["third"]
+    assert final["next_cursor"] is None
+    assert final["has_more"] is False
+    assert client._execute.call_args.args[1]["cursor"] == "old-run-without-origin"
+
+
+def test_partial_history_filter_final_empty_page_has_no_cursor():
+    client = Mock()
+    client._execute.return_value = {
+        "runsOrError": {
+            "__typename": "Runs",
+            "results": [originating_run("unmatched", "other", "another")],
+        }
+    }
+    assert DagsterAdapter(client).list_runs(repository_name="custom") == {
+        "items": [],
+        "next_cursor": None,
+        "has_more": False,
+    }
+
+
+@pytest.mark.parametrize("field", ["repository_location_name", "repository_name"])
+def test_blank_history_origin_filter_fails_before_querying(field):
+    client = Mock()
+    with pytest.raises(HTTPException) as error:
+        DagsterAdapter(client).list_runs(**{field: "  "})
+    assert error.value.status_code == 422
+    client._execute.assert_not_called()
 
 
 @pytest.mark.parametrize(

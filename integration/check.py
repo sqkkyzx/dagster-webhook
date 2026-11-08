@@ -21,7 +21,7 @@ import time
 import tomllib
 from pathlib import Path
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import ProxyHandler, Request, build_opener
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -363,12 +363,31 @@ def check(environment):
     assert len(locations["items"]) == 1, locations
     status, jobs = api("/api/v1/jobs")
     assert status == 200, jobs
+    assert all("job_id" not in item for item in jobs["items"]), jobs
     job = next(job for job in jobs["items"] if job["job_name"] == "acceptance_job")
-    job_url = "/api/v1/jobs/" + job["job_id"]
+    assert job["repository_name"] == "__repository__", job
+    job_url = "/api/v1/jobs/" + quote(job["job_name"], safe="")
+    selection = {
+        "repository_location_name": job["repository_location_name"],
+        "repository_name": job["repository_name"],
+    }
+    selected_query = "?" + urlencode(selection)
     assert api(job_url)[0] == api(job_url + "/config-schema")[0] == 200
+    status, selected_job = api(job_url + selected_query)
+    assert status == 200 and selected_job["job_name"] == job["job_name"], selected_job
+    assert "job_id" not in selected_job, selected_job
+    status, selected_jobs = api("/api/v1/jobs" + selected_query)
+    assert status == 200 and selected_jobs["items"], selected_jobs
+    assert all(
+        item["repository_location_name"] == selection["repository_location_name"]
+        and item["repository_name"] == selection["repository_name"]
+        for item in selected_jobs["items"]
+    ), selected_jobs
     config = {"ops": {"acceptance_step": {"config": {"count": 1}}}}
-    payload = {"job_id": job["job_id"], "run_config": config}
-    status, valid = api(job_url + "/validate", "POST", {"run_config": config})
+    payload = {"job_name": job["job_name"], "run_config": config}
+    status, valid = api(
+        job_url + "/validate" + selected_query, "POST", {"run_config": config}
+    )
     assert status == 200 and valid["valid"] is True, valid
     bad_config = {"ops": {"acceptance_step": {"config": {"count": "bad"}}}}
     status, invalid = api(job_url + "/validate", "POST", {"run_config": bad_config})
@@ -377,19 +396,27 @@ def check(environment):
         error["path"] == ["ops", "acceptance_step", "config", "count"]
         for error in invalid["errors"]
     ), invalid
-    status, wrong_repository = api(
-        "/api/v1/submit_job",
-        "POST",
-        {"job_name": "acceptance_job", "repository_name": "absent_repository"},
-    )
+    wrong_selection = {
+        "job_name": "acceptance_job",
+        "repository_name": "absent_repository",
+    }
+    for path in ("/api/v1/submit_job", "/api/v1/runs/submit"):
+        status, wrong_repository = api(path, "POST", wrong_selection)
+        assert status == 404, (path, wrong_repository)
+    status, wrong_repository = api(job_url + "?repository_name=absent_repository")
     assert status == 404, wrong_repository
 
     direct_runs = []
     direct_before = count_submissions()
-    for _ in range(2):
-        status, direct = api("/api/v1/runs/submit", "POST", payload)
+    for direct_payload in (payload, {**payload, **selection}):
+        status, direct = api("/api/v1/runs/submit", "POST", direct_payload)
         assert status == 201, (status, direct)
-        assert direct["job_id"] == job["job_id"], direct
+        assert direct["job_name"] == job["job_name"], direct
+        assert direct["repository_location_name"] == job["repository_location_name"], (
+            direct
+        )
+        assert direct["repository_name"] == job["repository_name"], direct
+        assert "job_id" not in direct, direct
         assert direct["status_url"] == "/api/v1/runs/" + direct["run_id"], direct
         assert "submission_id" not in direct and "replayed" not in direct, direct
         direct_runs.append(direct)
@@ -440,7 +467,12 @@ def check(environment):
         job for job in jobs["items"] if job["job_name"] == "acceptance_outputs_job"
     )
     status, output_run = api(
-        "/api/v1/runs/submit", "POST", {"job_id": output_job["job_id"]}
+        "/api/v1/runs/submit",
+        "POST",
+        {
+            "job_name": output_job["job_name"],
+            "repository_location_name": output_job["repository_location_name"],
+        },
     )
     assert status == 201, (status, output_run)
     wait_until(
@@ -517,8 +549,8 @@ def check(environment):
     else:
         raise AssertionError("Output event pagination did not terminate")
     assert page_count > 1, page_count
-    # Planned outputs may appear as null before their HANDLED_OUTPUT is in a
-    # page. Every readable full-snapshot value must still be observed.
+    # Incremental pages include only handled outputs from that scan range.
+    # Every readable full-snapshot value must still be observed.
     assert set(expected_outputs) <= set(paged_outputs), (
         paged_outputs,
         expected_outputs,
@@ -565,10 +597,20 @@ def check(environment):
     first = wait_until(lambda: replay(payload, "concurrent"), "concurrent replay")
     assert count_submissions() == before + 1
     wait_until(lambda: run_status(first["run_id"]) == "SUCCESS", "fixture completion")
-    status, runs = api("/api/v1/runs?job_id=" + job["job_id"])
-    assert status == 200 and first["run_id"] in {
-        run["run_id"] for run in runs["items"]
-    }, runs
+    for run_filter in (
+        {"job_name": job["job_name"]},
+        {"job_name": job["job_name"], **selection},
+        {"job_name": job["job_name"], "repository_name": job["repository_name"]},
+        {
+            "job_name": job["job_name"],
+            "repository_location_name": job["repository_location_name"],
+        },
+    ):
+        status, runs = api("/api/v1/runs?" + urlencode(run_filter))
+        assert status == 200 and first["run_id"] in {
+            run["run_id"] for run in runs["items"]
+        }, runs
+        assert all("job_id" not in run for run in runs["items"]), runs
     status, events = api("/api/v1/runs/" + first["run_id"] + "/events?limit=2")
     assert status == 200 and events["items"] and events["next_cursor"], events
     environment.restart_gateway()
@@ -645,7 +687,13 @@ def check(environment):
     assert api("/health")[0] == 200
     status, available_record = api(submission_url)
     assert status == 200 and available_record["state"] == "ACCEPTED", available_record
-    print("PASS health stays live while upstream readiness fails", flush=True)
+    status, offline_replay = api("/api/v1/runs", "POST", payload, "concurrent")
+    assert status == 200 and offline_replay["run_id"] == first["run_id"], offline_replay
+    assert offline_replay["replayed"] is True, offline_replay
+    print(
+        "PASS health and accepted replay work while upstream readiness fails",
+        flush=True,
+    )
 
 
 def main():

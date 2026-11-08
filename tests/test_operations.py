@@ -13,7 +13,9 @@ from gateway.security import APIKey
 
 JOB_ID = encode_job_id("example_location", "example_repository", "example_job")
 PAYLOAD = {
-    "job_id": JOB_ID,
+    "job_name": "example_job",
+    "repository_location_name": "example_location",
+    "repository_name": "example_repository",
     "run_config": {"ops": {"extract": {"config": {"limit": 5}}}},
 }
 
@@ -21,6 +23,9 @@ PAYLOAD = {
 @pytest.fixture
 def operation_adapter(app):
     adapter = Mock(spec=DagsterAdapter)
+    adapter.list_jobs.return_value = {
+        "items": [{key: value for key, value in PAYLOAD.items() if key != "run_config"}]
+    }
     adapter.submit_run.side_effect = lambda _payload, run_id: {
         "run_id": run_id,
         "status": "QUEUED",
@@ -49,7 +54,10 @@ def test_first_submission_creates_and_replay_returns_same_run(
     created = first.json()
     assert created["replayed"] is False
     assert created["status"] == "QUEUED"
-    assert created["job_id"] == JOB_ID
+    assert created["job_name"] == "example_job"
+    assert created["repository_location_name"] == "example_location"
+    assert created["repository_name"] == "example_repository"
+    assert "job_id" not in created
     assert first.headers["location"] == created["status_url"]
     assert first.headers["idempotency-replayed"] == "false"
     assert first.headers["x-request-id"]
@@ -65,6 +73,94 @@ def test_first_submission_creates_and_replay_returns_same_run(
     assert assigned_run_id == created["run_id"]
     assert forwarded["run_config"] == PAYLOAD["run_config"]
     operation_adapter.find_submission_run.assert_not_called()
+
+
+@pytest.mark.parametrize("path", ["/api/v1/runs", "/api/v1/runs/submit"])
+def test_job_name_alone_infers_custom_repository_without_a_default_restriction(
+    client, operation_adapter, operation_store, submission_headers, monkeypatch, path
+):
+    monkeypatch.setenv("DAGSTER_REPOSITORY_NAME", "unrelated_default")
+    operation_adapter.submit_direct_run.return_value = {
+        "run_id": "direct-run",
+        "status": "QUEUED",
+    }
+    response = client.post(
+        path, json={"job_name": "example_job"}, headers=submission_headers
+    )
+    assert response.status_code == 201
+    body = response.json()
+    assert body["repository_name"] == "example_repository"
+    assert body["repository_location_name"] == "example_location"
+    assert "job_id" not in body
+    operation_adapter.list_jobs.assert_called_once_with(
+        location_name=None, repository_name=None
+    )
+    submit = (
+        operation_adapter.submit_run
+        if path.endswith("/runs")
+        else operation_adapter.submit_direct_run
+    )
+    assert submit.call_args.args[0]["job_id"] == JOB_ID
+
+
+def test_named_idempotent_replay_never_rediscovers_a_moved_or_unavailable_job(
+    client, operation_adapter, operation_store, submission_headers
+):
+    request = {"job_name": "example_job"}
+    first = client.post("/api/v1/runs", json=request, headers=submission_headers)
+    assert first.status_code == 201
+    operation_adapter.list_jobs.side_effect = AssertionError("Workspace is unavailable")
+    replay = client.post("/api/v1/runs", json=request, headers=submission_headers)
+    assert replay.status_code == 200
+    assert replay.json()["run_id"] == first.json()["run_id"]
+    assert replay.json()["repository_name"] == "example_repository"
+    operation_adapter.submit_run.assert_called_once()
+    operation_adapter.list_jobs.assert_called_once()
+
+
+def test_ambiguous_name_does_not_launch_or_keep_a_key_and_location_is_enough(
+    client, operation_adapter, operation_store, submission_headers
+):
+    first, second = (
+        {
+            "job_name": "example_job",
+            "repository_location_name": location,
+            "repository_name": "custom_repository",
+        }
+        for location in ("first", "second")
+    )
+    operation_adapter.list_jobs.return_value = {"items": [first, second]}
+    response = client.post(
+        "/api/v1/runs", json={"job_name": "example_job"}, headers=submission_headers
+    )
+    assert response.status_code == 409
+    assert response.json()["code"] == "JOB_SELECTION_AMBIGUOUS"
+    assert "job_id" not in response.text
+    operation_adapter.submit_run.assert_not_called()
+    with sqlite3.connect(operation_store.path) as connection:
+        assert connection.execute("SELECT count(*) FROM submissions").fetchone()[0] == 0
+    selected = client.post(
+        "/api/v1/runs",
+        json={"job_name": "example_job", "repository_location_name": "second"},
+        headers=submission_headers,
+    )
+    assert selected.status_code == 201
+    assert selected.json()["repository_name"] == "custom_repository"
+    assert selected.json()["repository_location_name"] == "second"
+
+
+def test_discovery_failure_is_not_reported_as_an_uncertain_launch(
+    client, operation_adapter, operation_store, submission_headers
+):
+    operation_adapter.list_jobs.side_effect = DagsterGraphQLClientError("upstream down")
+    response = client.post(
+        "/api/v1/runs", json={"job_name": "example_job"}, headers=submission_headers
+    )
+    assert response.status_code == 502
+    assert response.json()["code"] == "DAGSTER_UNAVAILABLE"
+    operation_adapter.submit_run.assert_not_called()
+    with sqlite3.connect(operation_store.path) as connection:
+        assert connection.execute("SELECT count(*) FROM submissions").fetchone()[0] == 0
 
 
 def test_reusing_key_with_changed_payload_returns_structured_conflict(
@@ -228,7 +324,7 @@ def test_misspelled_submission_field_is_rejected_without_creating_run(
 ):
     response = client.post(
         "/api/v1/runs",
-        json={"job_id": JOB_ID, "run_confg": {}},
+        json={"job_name": "example_job", "run_confg": {}},
         headers=submission_headers,
     )
     assert response.status_code == 422
@@ -240,9 +336,9 @@ def test_invalid_job_identity_is_rejected_before_claiming_key(
     client, operation_adapter, operation_store, submission_headers
 ):
     bad = client.post(
-        "/api/v1/runs", json={"job_id": "not-a-job-id"}, headers=submission_headers
+        "/api/v1/runs", json={"job_name": "not-a-job"}, headers=submission_headers
     )
-    assert bad.status_code == 422
+    assert bad.status_code == 404
     good = client.post("/api/v1/runs", json=PAYLOAD, headers=submission_headers)
     assert good.status_code == 201
     operation_adapter.submit_run.assert_called_once()
@@ -829,7 +925,14 @@ def test_direct_run_always_creates_and_has_no_store_dependency(
     assert responses[0].json()["run_id"] != responses[1].json()["run_id"]
     for response in responses:
         body = response.json()
-        assert set(body) == {"run_id", "status", "job_id", "status_url"}
+        assert set(body) == {
+            "run_id",
+            "status",
+            "job_name",
+            "repository_location_name",
+            "repository_name",
+            "status_url",
+        }
         assert response.headers["Location"] == body["status_url"]
         assert "Idempotency-Replayed" not in response.headers
     assert operation_adapter.submit_direct_run.call_count == 2
@@ -874,3 +977,10 @@ def test_direct_submit_is_documented_separately_from_idempotent_submit(client):
         "idempotency_key"
         not in schema["components"]["schemas"]["RunSubmissionRequest"]["properties"]
     )
+    for model in ("RunSubmissionRequest", "IdempotentRunSubmissionRequest"):
+        request = schema["components"]["schemas"][model]
+        assert request["required"] == ["job_name"]
+        assert "job_id" not in request["properties"]
+        for optional in ("repository_location_name", "repository_name"):
+            assert request["properties"][optional].get("default") is None
+            assert {"type": "null"} in request["properties"][optional]["anyOf"]

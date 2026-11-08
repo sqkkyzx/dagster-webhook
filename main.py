@@ -102,8 +102,14 @@ Dagster 错误响应包含 `message`、`detail` 和 `error_type`。
 `X-Request-ID` 响应头返回。外层请求字段严格校验，拼错字段返回 `422`。
 
 ## 资源 API
-先通过 `/api/v1/jobs` 发现 Job 并取得复合 `job_id`，再获取配置 Schema 或执行只读验证。
-`POST /api/v1/runs/submit` 按 `job_id` 非幂等提交，每次成功请求创建新 Run，返回 `201`。
+先通过 `/api/v1/jobs` 发现 Job。对外统一使用自然名称 `job_name`，发现和运行响应同时提供
+`repository_location_name`、`repository_name`，不要求调用方处理复合 ID。
+旧版资源请求中的 `job_id` 改用 `job_name`，Job 路径也使用名称；历史不确定提交仍可按原 `submission_id` 查询和核对，不能换 Key 盲目重提。
+`GET /api/v1/jobs/{{job_name}}`、`GET /api/v1/jobs/{{job_name}}/config-schema`
+和 `POST /api/v1/jobs/{{job_name}}/validate`
+使用可选查询参数 `repository_location_name`、`repository_name` 选择同名 Job。
+两个资源式提交接口的 Body 均要求 `job_name`，可选相同的代码位置和 Repository 字段。
+`POST /api/v1/runs/submit` 非幂等提交，每次成功请求创建新 Run，返回 `201`。
 `POST /api/v1/runs` 按调用方和 Key 去重，Key 可通过 `Idempotency-Key` 请求头或 Body 顶层
 `idempotency_key` 提供，至少一处必填；两处相同可以接受，不同则返回 `422`。
 Key 的传递位置不影响任务指纹，切换 Header 和 Body 后仍可重放原请求。
@@ -114,9 +120,17 @@ Key 的传递位置不影响任务指纹，切换 Header 和 Body 后仍可重�
 `409` 的结果不确定状态必须继续使用相同 Key 查询，不能换 Key 盲目重提。
 原有 `POST /api/v1/submit_job` 按 Job 名称非幂等提交，成功仍返回 `200`。
 提交接口均需要 `submit` 权限；非幂等请求超时后应先核查 Dagster，重试可能重复创建任务。
-旧提交接口的 `repository_name` 省略或为 null 时，使用 `DAGSTER_REPOSITORY_NAME`
-配置的默认值（默认 `__repository__`）；请求中显式指定的名称优先。
-新资源接口的 `job_id` 始终携带实际 Repository，不受该默认值覆盖。
+新 Job 详情、配置、校验和两个资源式提交接口会自动推断省略的位置／Repository。
+提交 Body 中的 null 也按省略处理，空字符串返回 `422`。
+只传 `job_name` 即可选择全局唯一的 Job；显式提供位置或 Repository 时在相应范围内匹配。
+没有匹配返回 `404`，存在多个匹配返回 `409 JOB_SELECTION_AMBIGUOUS` 和候选项，
+调用方需补充 `repository_location_name` 或 `repository_name`。
+旧的 `/api/v1/submit_job` 保留 `DAGSTER_REPOSITORY_NAME` 默认 Repository（默认
+`__repository__`），该默认值不用于上述新接口的自动推断。
+`GET /api/v1/runs?job_name=example_job` 可跨代码位置查询同名历史运行；指定
+`repository_location_name` 或 `repository_name` 可以独立筛选来源，省略项不添加限制。
+运行历史筛选不依赖当前 Job 仍存在；单独来源筛选的一页可能不足 limit 或为空，
+`has_more=true` 时继续使用 `next_cursor` 获取下一页。
 
 版本采用 `<Dagster 版本>.<网关修订号>`，例如 `{VERSION}`。
 """,
@@ -731,7 +745,7 @@ async def health_check():
 def submit_job(payload: SubmitJobRequest, client: ClientDependency):
     """按 Job 名称非幂等提交一次执行，成功返回 200 和 Run ID。
 
-    不要求幂等键，每次成功调用都会创建新 Run。需要使用复合 job_id 直接提交时，
+    不要求幂等键，每次成功调用都会创建新 Run。需要资源式响应的非幂等提交时，
     可选择 POST /api/v1/runs/submit；需要幂等控制时使用 POST /api/v1/runs。
     存在多个同名 Job 时需指定代码位置。
 

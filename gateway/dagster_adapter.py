@@ -11,6 +11,7 @@ from dagster_graphql import DagsterGraphQLClient, DagsterGraphQLClientError
 from fastapi import HTTPException
 
 from gateway.errors import GatewayHTTPError
+from gateway.job_resolution import _reference_name
 from gateway.run_outputs import (
     OUTPUTS_EVENTS_QUERY,
     OUTPUTS_RUN_QUERY,
@@ -339,10 +340,32 @@ def _selector(job_id: str, op_selection=None, asset_selection=None) -> dict:
     return selector
 
 
-def build_runs_filter(statuses=None, job_name=None, tags=None, job_id=None) -> dict:
+def build_runs_filter(
+    statuses=None,
+    job_name=None,
+    tags=None,
+    job_id=None,
+    repository_location_name=None,
+    repository_name=None,
+) -> dict:
     """Use the same repository-label filter as Dagster's own Pipeline.runs."""
     filters = {}
     resolved_tags = dict(tags or {})
+    location = (
+        _reference_name(repository_location_name, "repository_location_name")
+        if repository_location_name is not None
+        else None
+    )
+    repository = (
+        _reference_name(repository_name, "repository_name")
+        if repository_name is not None
+        else None
+    )
+    label = (
+        f"{repository}@{location}"
+        if location is not None and repository is not None
+        else None
+    )
     if job_id is not None:
         selector = decode_job_id(job_id)
         selected_name = selector["pipelineName"]
@@ -350,16 +373,28 @@ def build_runs_filter(statuses=None, job_name=None, tags=None, job_id=None) -> d
             raise GatewayHTTPError(
                 422, "REQUEST_VALIDATION_FAILED", "job_name conflicts with job_id"
             )
-        label = f"{selector['repositoryName']}@{selector['repositoryLocationName']}"
+        selected_label = (
+            f"{selector['repositoryName']}@{selector['repositoryLocationName']}"
+        )
+        if label is not None and label != selected_label:
+            raise GatewayHTTPError(
+                422,
+                "REQUEST_VALIDATION_FAILED",
+                "Repository location or name conflicts with the selected Job",
+            )
+        label = selected_label
+        job_name = selected_name
+    if label is not None:
         if (
             REPOSITORY_LABEL_TAG in resolved_tags
             and resolved_tags[REPOSITORY_LABEL_TAG] != label
         ):
             raise GatewayHTTPError(
-                422, "REQUEST_VALIDATION_FAILED", "Repository tag conflicts with job_id"
+                422,
+                "REQUEST_VALIDATION_FAILED",
+                "Repository tag conflicts with the selected location and repository",
             )
         resolved_tags[REPOSITORY_LABEL_TAG] = label
-        job_name = selected_name
     if statuses:
         filters["statuses"] = statuses
     if job_name:
@@ -445,14 +480,18 @@ class DagsterAdapter:
         }
 
     def get_config_schema(self, job_id: str) -> dict:
+        selector = decode_job_id(job_id)
         result = _result(
-            self._execute(CONFIG_QUERY, {"selector": decode_job_id(job_id)}),
+            self._execute(CONFIG_QUERY, {"selector": selector}),
             "runConfigSchemaOrError",
             "RunConfigSchema",
         )
         # Dagster exposes native config types, not JSON Schema.
         return {
             "job_id": job_id,
+            "job_name": selector["pipelineName"],
+            "repository_location_name": selector["repositoryLocationName"],
+            "repository_name": selector["repositoryName"],
             "format": "dagster",
             "root_type_key": result["rootConfigType"]["key"],
             "default_yaml": result.get("rootDefaultYaml", ""),
@@ -462,19 +501,26 @@ class DagsterAdapter:
     def validate_job(
         self, job_id: str, run_config: dict, op_selection=None, asset_selection=None
     ) -> dict:
+        selector = _selector(job_id, op_selection, asset_selection)
+        identity = {
+            "job_id": job_id,
+            "job_name": selector["pipelineName"],
+            "repository_location_name": selector["repositoryLocationName"],
+            "repository_name": selector["repositoryName"],
+        }
         data = self._execute(
             VALIDATE_QUERY,
             {
-                "selector": _selector(job_id, op_selection, asset_selection),
+                "selector": selector,
                 "config": run_config,
             },
         )
         result = data["isPipelineConfigValid"]
         if result["__typename"] == "PipelineConfigValidationValid":
-            return {"job_id": job_id, "valid": True, "errors": []}
+            return {**identity, "valid": True, "errors": []}
         if result["__typename"] == "RunConfigValidationInvalid":
             return {
-                "job_id": job_id,
+                **identity,
                 "valid": False,
                 "errors": _config_errors(result["errors"]),
             }
@@ -490,8 +536,17 @@ class DagsterAdapter:
         cursor=None,
         limit=50,
         job_id=None,
+        repository_location_name=None,
+        repository_name=None,
     ) -> dict:
-        filters = build_runs_filter(statuses, job_name, tags, job_id)
+        filters = build_runs_filter(
+            statuses,
+            job_name,
+            tags,
+            job_id,
+            repository_location_name,
+            repository_name,
+        )
         result = _result(
             self._execute(
                 RUNS_QUERY, {"filter": filters, "cursor": cursor, "limit": limit + 1}
@@ -501,10 +556,28 @@ class DagsterAdapter:
         )
         records = result["results"]
         has_more = len(records) > limit
-        items = [_run(record) for record in records[:limit]]
+        # Consume only the native page, so a filtered empty page can still
+        # advance its cursor without skipping the lookahead record.
+        consumed = records[:limit]
+        items = [_run(record) for record in consumed]
+        if (repository_location_name is None) != (repository_name is None):
+            if repository_location_name is not None:
+                location = _reference_name(
+                    repository_location_name, "repository_location_name"
+                )
+                items = [
+                    item
+                    for item in items
+                    if item["repository_location_name"] == location
+                ]
+            else:
+                repository = _reference_name(repository_name, "repository_name")
+                items = [
+                    item for item in items if item["repository_name"] == repository
+                ]
         return {
             "items": items,
-            "next_cursor": items[-1]["run_id"] if has_more and items else None,
+            "next_cursor": consumed[-1]["runId"] if has_more and consumed else None,
             "has_more": has_more,
         }
 

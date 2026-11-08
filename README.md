@@ -66,7 +66,7 @@ docker run --rm --name dagster-webhook \
 | `DAGSTER_URL` | 未配置 | 完整的 HTTP(S) 部署 URL，优先于 host／port |
 | `DAGSTER_HOST` | `webserver` | 兼容的上游主机名或 IP，不含协议及路径 |
 | `DAGSTER_PORT` | `3000` | 未配置 URL 时使用的上游端口 |
-| `DAGSTER_REPOSITORY_NAME` | `__repository__` | 旧提交接口省略或传入 `null` 的 `repository_name` 使用此值；显式请求值优先 |
+| `DAGSTER_REPOSITORY_NAME` | `__repository__` | 仅旧提交接口省略或传入 `null` 的 `repository_name` 使用此值；新 Job 资源接口自动推断，运行列表不设隐式 Repository 限制 |
 | `DAGSTER_TIMEOUT` | `120` | 上游请求超时，单位为秒，必须大于 0 |
 | `DAGSTER_READINESS_TIMEOUT` | `3` | readiness 上游检查超时，单位为秒 |
 | `DAGSTER_HEADERS_JSON` | `{}` | 上游 HTTP 请求头的字符串字典，可配置鉴权头 |
@@ -111,10 +111,10 @@ export APP_API_KEYS_JSON='[
 | `GET` | `/ready` | 短超时检查 Dagster 是否可服务 |
 | `GET` | `/api/v1/locations` | 列出代码位置及加载状态 |
 | `GET` | `/api/v1/jobs` | 发现 Job，可按位置／Repository 筛选 |
-| `GET` | `/api/v1/jobs/{job_id}` | 查询 Job 详情 |
-| `GET` | `/api/v1/jobs/{job_id}/config-schema` | 查询 Job 的配置类型和字段 |
-| `POST` | `/api/v1/jobs/{job_id}/validate` | 提交前校验配置和执行选择，不创建 Run |
-| `POST` | `/api/v1/runs/submit` | 按 `job_id` 直接创建 Run，非幂等 |
+| `GET` | `/api/v1/jobs/{job_name}` | 查询 Job 详情 |
+| `GET` | `/api/v1/jobs/{job_name}/config-schema` | 查询 Job 的配置类型和字段 |
+| `POST` | `/api/v1/jobs/{job_name}/validate` | 提交前校验配置和执行选择，不创建 Run |
+| `POST` | `/api/v1/runs/submit` | 按 Job 名称直接创建 Run，非幂等 |
 | `POST` | `/api/v1/runs` | 带幂等控制地创建 Run，Key 可放在 Header 或 Body |
 | `GET` | `/api/v1/runs` | 过滤、分页查询运行列表 |
 | `GET` | `/api/v1/runs/{run_id}` | 查询运行详情、时间和失败摘要 |
@@ -133,13 +133,17 @@ curl --fail-with-body http://localhost:8080/api/v1/jobs \
   -H "Authorization: Bearer $APP_API_TOKEN"
 ```
 
-Job 列表返回的 `job_id` 是“代码位置＋Repository＋Job 名称”的 URL 安全编码，用返回值调用详情和提交接口。它不是 Job 名称；同名 Job 位于不同代码位置时具有不同 ID。
+外部接口直接使用 `job_name`。发现结果同时提供 `repository_location_name` 和 `repository_name`，同名 Job 可以通过这两个字段明确选择；不需要构造或保存复合 ID。Job 列表可用同名查询参数按代码位置和 Repository 筛选。
+
+从 `1.13.26.8` 及更早版本升级时，资源接口请求中的 `job_id` 改为 `job_name`，Job 路径也改用名称。旧持久化提交记录仍可通过 `submission_url` 查询和 `reconcile` 核对；尚未确认结果的旧请求应先核对原提交，不能更换 Key 直接重提。
+
+详情、配置 Schema 和校验接口把 Job 名称放在路径中，代码位置和 Repository 通过可选查询参数传递。仅提供 `job_name` 时，在所有已加载位置中查找唯一匹配；指定位置或 Repository 时，在相应范围内查找并推断未提供的部分。没有匹配返回 `404`，仍有多个匹配返回 `409 JOB_SELECTION_AMBIGUOUS` 并提供候选项，调用方需补充位置／Repository。选择字段省略时自动推断，提交 Body 中的 `null` 也按省略处理；空字符串返回 `422`。新资源接口不会默认限制为 `__repository__`。
 
 ```bash
-curl --fail-with-body "http://localhost:8080/api/v1/jobs/$JOB_ID/config-schema" \
+curl --fail-with-body "http://localhost:8080/api/v1/jobs/example_job/config-schema" \
   -H "Authorization: Bearer $APP_API_TOKEN"
 
-curl --fail-with-body -X POST "http://localhost:8080/api/v1/jobs/$JOB_ID/validate" \
+curl --fail-with-body -X POST "http://localhost:8080/api/v1/jobs/example_job/validate?repository_location_name=example_location" \
   -H "Authorization: Bearer $APP_API_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{"run_config":{}}'
@@ -155,28 +159,30 @@ curl --fail-with-body -X POST "http://localhost:8080/api/v1/jobs/$JOB_ID/validat
 
 | 接口 | Job 选择方式 | 幂等语义 | 成功响应 |
 | --- | --- | --- | --- |
-| `POST /api/v1/runs/submit` | 发现接口返回的 `job_id` | 非幂等，每次成功请求创建新 Run | `201`，包含 `run_id`、状态和查询链接 |
-| `POST /api/v1/runs` | `job_id` | 按调用方和 Key 去重 | 首次 `201`，已接受请求重放 `200` |
+| `POST /api/v1/runs/submit` | `job_name`，可选位置和 Repository | 非幂等，每次成功请求创建新 Run | `201`，包含 `run_id`、状态和查询链接 |
+| `POST /api/v1/runs` | `job_name`，可选位置和 Repository | 按调用方和 Key 去重 | 首次 `201`，已接受请求重放 `200` |
 | `POST /api/v1/submit_job` | Job 名称、位置和 Repository | 非幂等，保留旧 RPC 契约 | `200`，包含 Run ID |
 
 ### 非幂等提交
 
-使用资源接口直接提交时，不需要幂等键：
+使用资源接口直接提交时，不需要幂等键。`job_name` 必填，`repository_location_name` 和 `repository_name` 可选；省略位置／Repository 时自动推断，同名 Job 的 `404`／`409` 选择规则与详情、配置和校验相同。可显式添加 `"repository_location_name":"example_location"` 选择发现结果中的位置：
 
 ```bash
 curl --fail-with-body -X POST http://localhost:8080/api/v1/runs/submit \
   -H "Authorization: Bearer $APP_API_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
-    "job_id":"<copy-from-jobs-response>",
+    "job_name":"example_job",
     "run_config":{},
     "tags":{"source":"webhook"}
   }'
 ```
 
-成功返回 `201`，响应提供 `run_id`、提交时状态、`job_id` 和 `status_url`。此接口直接联系 Dagster，不创建本地幂等记录或提交恢复标记；相同请求调用两次会创建两个 Run。此入口忽略 `Idempotency-Key` Header，Body 不接受 `idempotency_key` 字段。若请求超时，Dagster 可能已经接收，必须先核查运行，自动重试可能重复执行。需要防止重复执行时，应使用下面的幂等接口。
+成功返回 `201`，响应提供 `run_id`、提交时状态、`job_name`、`repository_location_name`、`repository_name` 和 `status_url`。此接口直接联系 Dagster，不创建本地幂等记录或提交恢复标记；相同请求调用两次会创建两个 Run。此入口忽略 `Idempotency-Key` Header，Body 不接受 `idempotency_key` 字段。若请求超时，Dagster 可能已经接收，必须先核查运行，自动重试可能重复执行。需要防止重复执行时，应使用下面的幂等接口。
 
 ### 幂等提交
+
+相同 Key 的请求应保持 `job_name`、可选位置／Repository、配置和执行选择一致，省略与 `null` 等价。已接受请求重放直接返回持久化快照，不再发现 Job；上游不可达或 Job 已迁移时也不会创建新 Run。
 
 Key 可以放在 `Idempotency-Key` 请求头中：
 
@@ -186,7 +192,7 @@ curl --fail-with-body -X POST http://localhost:8080/api/v1/runs \
   -H 'Idempotency-Key: source-event-20261108-001' \
   -H 'Content-Type: application/json' \
   -d '{
-    "job_id":"<copy-from-jobs-response>",
+    "job_name":"example_job",
     "run_config":{},
     "tags":{"source":"webhook"}
   }'
@@ -199,7 +205,7 @@ curl --fail-with-body -X POST http://localhost:8080/api/v1/runs \
   -H "Authorization: Bearer $APP_API_TOKEN" \
   -H 'Content-Type: application/json' \
   -d '{
-    "job_id":"<copy-from-jobs-response>",
+    "job_name":"example_job",
     "idempotency_key":"source-event-20261108-001",
     "run_config":{},
     "tags":{"source":"webhook"}
@@ -257,7 +263,8 @@ curl --fail-with-body -X POST \
 ```bash
 curl --fail-with-body --get http://localhost:8080/api/v1/runs \
   -H "Authorization: Bearer $APP_API_TOKEN" \
-  --data-urlencode "job_id=$JOB_ID" \
+  --data-urlencode 'job_name=example_job' \
+  --data-urlencode 'repository_location_name=example_location' \
   --data-urlencode 'statuses=FAILURE' \
   --data-urlencode 'tag=source=webhook' \
   --data-urlencode 'limit=20'
@@ -272,11 +279,11 @@ curl --fail-with-body --get "http://localhost:8080/api/v1/runs/$RUN_ID/events" \
 
 运行列表的 `limit` 默认为 50，范围 1–200；事件列表默认为 100，范围 1–1000。两类列表返回 `items`、`next_cursor`、`has_more`。运行列表在还有下一页时返回最后一个 Run ID 作为 `next_cursor`，没有下一页时为 `null`。事件列表返回 Dagster 不透明游标，即使当前 `has_more=false` 也可能保留 `next_cursor`，供后续继续轮询新事件。把游标原样传给下一次请求，两类游标不能互换。运行状态可能在分页过程中变化，游标分页不代表冻结的数据快照。代码位置和 Job 发现接口返回 `items`，不伪造分页能力。
 
-可重复传入 `statuses` 选择多个状态，例如 `?statuses=SUCCESS&statuses=FAILURE`；可重复传入 `tag=key=value` 组合标签条件。推荐用发现接口返回的 `job_id` 精确筛选“位置＋Repository＋Job”；`job_name` 过滤会匹配多个位置中的同名 Job，不代表唯一 Job 身份。`job_id` 与同时提供的 `job_name` 或保留 Repository 标签存在冲突时返回 `422`。
+可重复传入 `statuses` 选择多个状态，例如 `?statuses=SUCCESS&statuses=FAILURE`；可重复传入 `tag=key=value` 组合标签条件。只传 `job_name` 时匹配所有代码位置中的同名历史运行，无需当前部署仍保留该 Job。可添加 `repository_location_name` 或 `repository_name` 筛选来源，两者可各自单独提供；省略任何一项都不添加对应限制，也不使用默认 Repository。位置／Repository 与显式来源标签冲突时返回 `422`。单独筛选位置或 Repository 时，一页可能少于 `limit` 或为空；`has_more=true` 时仍应使用 `next_cursor` 继续读取。
 
-精确 Job 筛选采用 Dagster 原生运行列表的 Repository 来源标签。缺少该来源标签的旧运行不会匹配 `job_id`，可改用 `job_name` 查询，再根据详情判断来源。
+位置／Repository 筛选采用 Dagster 原生运行列表的 Repository 来源标签。缺少该来源标签的旧运行不会匹配此筛选，可只用 `job_name` 查询，再根据详情判断来源。
 
-详情提供运行状态、开始／结束时间、标签、父／根 Run ID、失败摘要和来源字段 `job_id`、`repository_location_name`、`repository_name`；历史运行缺少来源时，这些来源字段可为 `null`。列表／详情不会默认返回整份运行配置。事件接口提供 Dagster 结构化事件，原始 stdout／stderr 的完整下载不在该接口契约中。输出查询可读取挂载目录中 IO Manager 保存的 JSON 兼容结果；无法读取的输出值为 `null`。
+详情提供运行状态、开始／结束时间、标签、父／根 Run ID、失败摘要、Job 名称 `job_name` 以及来源字段 `repository_location_name`、`repository_name`；历史运行缺少来源时，这些来源字段可为 `null`。列表／详情不会默认返回整份运行配置。事件接口提供 Dagster 结构化事件，原始 stdout／stderr 的完整下载不在该接口契约中。输出查询可读取挂载目录中 IO Manager 保存的 JSON 兼容结果；无法读取的输出值为 `null`。
 
 ### 各 op 的输出和状态
 
@@ -319,7 +326,7 @@ curl --fail-with-body \
 ```yaml
 services:
   dagster-webhook:
-    image: sqkkyzx/dagster-webhook:1.13.26.8
+    image: sqkkyzx/dagster-webhook:1.13.26.9
     volumes:
       - ./data:/data
       - ./storage/io-storage:/opt/dagster/dagster_home/storage:ro
@@ -367,7 +374,7 @@ curl --fail-with-body -X POST http://localhost:8080/api/v1/runs/terminate-batch 
 | `POST` | `/api/v1/reload_location` | 重载代码位置 |
 | `POST` | `/api/v1/shutdown_location` | 关闭代码位置；上游 SDK 已弃用该能力 |
 
-这些路径保留既有字段和主要成功响应。原 `submit_job` 不要求幂等键，每次成功调用均可创建新 Run；使用 `job_id` 的非幂等调用可选择 `/api/v1/runs/submit`，需要防止重复触发时使用 `/api/v1/runs`。代码位置操作检查 SDK 的操作状态，上游返回失败时不会报告 `reloaded`／`shutdown` 成功。
+这些路径保留既有字段和主要成功响应。原 `submit_job` 不要求幂等键，每次成功调用均可创建新 Run；使用资源式响应的非幂等调用可选择 `/api/v1/runs/submit`，需要防止重复触发时使用 `/api/v1/runs`。代码位置操作检查 SDK 的操作状态，上游返回失败时不会报告 `reloaded`／`shutdown` 成功。
 
 原 RPC 提交示例：
 
@@ -380,7 +387,7 @@ curl --fail-with-body -X POST http://localhost:8080/api/v1/submit_job \
 
 `repository_name` 默认使用启动环境中的 `DAGSTER_REPOSITORY_NAME`，未配置时为 `__repository__`，通常无需修改。省略该字段或传入 `null` 都使用此默认值，空字符串仍返回 `422`。特殊情况下可在请求中显式传入其他 `repository_name`，其优先级高于环境变量。未指定代码位置时，网关仅在选定 Repository 内查找该 Job：无匹配返回 `404`，多个位置匹配返回 `409 JOB_SELECTION_AMBIGUOUS` 并附候选位置，调用方需指定 `repository_location_name`。网关不会用其他 Repository 覆盖请求值或默认值。
 
-例如，整个网关主要连接一个使用自定义 Repository 的部署，可以设置 `DAGSTER_REPOSITORY_NAME=my_repository`；只有个别请求不同，则直接在请求中覆盖。该默认值只作用于旧的 `/api/v1/submit_job`；新的 `job_id` 资源 API 始终使用 ID 编码的实际 Repository，不会被默认值覆盖。
+例如，整个网关主要连接一个使用自定义 Repository 的部署，可以设置 `DAGSTER_REPOSITORY_NAME=my_repository`；只有个别请求不同，则直接在请求中覆盖。该默认值仅用于旧的 `/api/v1/submit_job`。新的 Job 详情／配置／校验和两个资源式提交接口会自动推断省略的 Repository，不套用此默认值。运行列表省略位置或 Repository 时不添加对应限制，只按 `job_name` 可跨位置和 Repository 匹配。
 
 可通过 `op_selection` 选择 op，通过 `asset_selection` 选择资产；分层资产键可表示为字符串数组，例如 `[["warehouse","orders"]]`。
 
@@ -407,7 +414,7 @@ curl --fail-with-body -X POST http://localhost:8080/api/v1/submit_job \
 
 ## 版本、测试与发布
 
-版本格式为 `<Dagster 主版本.次版本.补丁版本>.<私有修订号>`。`1.13.26.8` 表示依赖 Dagster `1.13.26` 的第 8 个网关修订。升级 Dagster 时同步更新前三段，仅修改网关时递增最后一段。HTTP API 的 `/api/v1` 契约与包版本独立演进。
+版本格式为 `<Dagster 主版本.次版本.补丁版本>.<私有修订号>`。`1.13.26.9` 表示依赖 Dagster `1.13.26` 的第 9 个网关修订。升级 Dagster 时同步更新前三段，仅修改网关时递增最后一段。HTTP API 的 `/api/v1` 契约与包版本独立演进。
 
 `pyproject.toml` 是网关版本的唯一来源，健康检查、OpenAPI 和 CI 发布使用相同版本。CI 校验版本与固定 Dagster 依赖的对应关系；已有版本标签属于其他提交时拒绝发布。
 

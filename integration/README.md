@@ -39,8 +39,13 @@ uv pip install --python /tmp/dagster-gateway-acceptance/bin/python . dagster-web
 ## 检查内容
 
 - 健康、readiness、ReDoc/OpenAPI 版本、位置和 Job 发现。
+- 使用自然名称 `job_name` 调用详情、配置、校验和两种提交接口；根据发现结果选择
+  `repository_location_name`，省略位置／Repository 时自动推断，外部响应无复合 ID。
+  测试定义的 Repository 为 `__repository__`，旧 RPC 提交仍使用其默认 Repository 配置。
+- 运行列表可只按 Job 名称跨位置查询，也可分别或同时指定位置、Repository 筛选历史来源，
+  省略项不添加隐式限制。
 - 原生配置 Schema、正确/错误配置验证及结构化错误路径。
-- 旧提交指定不存在的 Repository 时明确拒绝，不自动改投其他 Repository。
+- 新旧提交、Job 查询指定不存在的 Repository 时明确拒绝，不自动改投其他 Repository。
 - 非幂等资源接口连续提交相同参数，创建两个不同 Run，且不注入提交恢复标记。
 - 幂等 Key 可从 Body 提供，并使用 Header 重放到同一 Run；两处相同可重放，
   两处冲突或均未提供返回 422，且不向 Dagster 发送创建请求。
@@ -54,7 +59,7 @@ uv pip install --python /tmp/dagster-gateway-acceptance/bin/python . dagster-web
 - 代理在 Dagster 确认接受后丢弃 launch 响应，验证 UNKNOWN、submission 查询、
   重启、显式核对和同 Key 重放；代理统计确认没有第二次 launch。
 - 创建独立等待任务，真实批量终止与不存在 Run 混合返回逐项结果。
-- 停止独立 Dagster 后，readiness 返回 503，health 和本地提交记录查询继续可用。
+- 停止独立 Dagster 后，readiness 返回 503，health、本地提交记录查询和已接受请求的幂等重放继续可用。
 
 `upstream_proxy.py` 的控制接口仅供测试，不会复制进应用镜像。
 脚本失败会输出测试进程日志；所有进程/容器由本次脚本创建并负责清理。

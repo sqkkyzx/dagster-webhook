@@ -5,7 +5,7 @@ import json
 from typing import Annotated, Any, Literal
 
 from dagster import DagsterRunStatus
-from fastapi import APIRouter, Depends, Path, Query
+from fastapi import APIRouter, Depends, Path, Query, Request
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -15,25 +15,51 @@ from pydantic import (
     model_validator,
 )
 
-from gateway.dagster_adapter import DagsterAdapter, build_runs_filter, encode_job_id
+from gateway.dagster_adapter import DagsterAdapter, build_runs_filter
 from gateway.errors import GatewayHTTPError, responses
+from gateway.job_resolution import resolve_job_reference
 
 NonEmpty = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 AssetPath = Annotated[list[NonEmpty], Field(min_length=1)]
-EXAMPLE_JOB_ID = encode_job_id("my_code", "my_repository", "daily_job")
+EXAMPLE_JOB_NAME = "daily_job"
 EXAMPLE_RUN_ID = "12345678-1234-1234-1234-123456789abc"
-JobId = Annotated[
-    str,
+JobName = Annotated[
+    NonEmpty,
     Path(
         min_length=1,
-        max_length=4096,
-        description="发现接口返回的唯一 Job ID，编码代码位置、Repository、Job 名称。",
-        examples=[EXAMPLE_JOB_ID],
+        description="Dagster Job 名称；同名 Job 用 repository_location_name 和 repository_name 定位。",
+        examples=[EXAMPLE_JOB_NAME],
     ),
 ]
 RunId = Annotated[
     NonEmpty, Path(description="Dagster Run ID。", examples=[EXAMPLE_RUN_ID])
 ]
+RepositoryLocationQuery = Annotated[
+    NonEmpty | None,
+    Query(
+        description="可选代码位置名称。省略时按 Job 名称和已指定的 Repository 查找；存在多个匹配时返回 409。",
+        examples=["my_code"],
+    ),
+]
+RepositoryQuery = Annotated[
+    NonEmpty | None,
+    Query(
+        description="可选 Repository 名称。省略时按 Job 名称和已指定代码位置推断实际 Repository；存在多个匹配时返回 409。",
+        examples=["__repository__"],
+    ),
+]
+
+
+def _public_job_result(result: dict, reference: dict) -> dict:
+    result = {
+        **result,
+        **{
+            name: reference[name]
+            for name in ("job_name", "repository_location_name", "repository_name")
+        },
+    }
+    result.pop("job_id", None)
+    return result
 
 
 class LocationRecord(BaseModel):
@@ -55,10 +81,6 @@ class LocationsResponse(BaseModel):
 
 
 class JobRecord(BaseModel):
-    job_id: str = Field(
-        description="位置、Repository、Job 名称组成的 URL 安全唯一标识。使用此值请求详情和提交。",
-        examples=[EXAMPLE_JOB_ID],
-    )
     job_name: str = Field(
         description="Job 名称，可能在不同位置或 Repository 中重复。",
         examples=["daily_job"],
@@ -105,7 +127,11 @@ class ConfigType(BaseModel):
 
 
 class ConfigSchemaResponse(BaseModel):
-    job_id: str = Field(description="被查询的 Job 唯一标识。")
+    job_name: str = Field(
+        description="被查询的 Job 名称。", examples=[EXAMPLE_JOB_NAME]
+    )
+    repository_location_name: str = Field(description="解析后的代码位置名称。")
+    repository_name: str = Field(description="本次实际使用的 Repository 名称。")
     format: str = Field(
         description="配置格式固定为 dagster，不是 JSON Schema。", examples=["dagster"]
     )
@@ -153,7 +179,11 @@ class ConfigValidationIssue(BaseModel):
 
 
 class ValidationResponse(BaseModel):
-    job_id: str = Field(description="被验证的 Job 唯一标识。")
+    job_name: str = Field(
+        description="被验证的 Job 名称。", examples=[EXAMPLE_JOB_NAME]
+    )
+    repository_location_name: str = Field(description="解析后的代码位置名称。")
+    repository_name: str = Field(description="本次实际使用的 Repository 名称。")
     valid: bool = Field(description="运行配置是否符合目标 Job 和执行范围。")
     errors: list[ConfigValidationIssue] = Field(
         description="配置错误列表；有效时为空。"
@@ -163,10 +193,6 @@ class ValidationResponse(BaseModel):
 class RunRecord(BaseModel):
     run_id: str = Field(description="Dagster Run 唯一标识。", examples=[EXAMPLE_RUN_ID])
     job_name: str = Field(description="运行的 Job 名称。")
-    job_id: str | None = Field(
-        None,
-        description="根据运行原始代码位置、Repository 和 Job 名称构成的 ID；历史运行缺少来源时为空。",
-    )
     repository_location_name: str | None = Field(
         None, description="运行原始代码位置；缺少来源信息时为空。"
     )
@@ -195,12 +221,16 @@ class RunRecord(BaseModel):
 
 
 class RunsResponse(BaseModel):
-    items: list[RunRecord] = Field(description="当前页运行，顺序由 Dagster 返回。")
+    items: list[RunRecord] = Field(
+        description="当前扫描窗口内匹配的运行，顺序由 Dagster 返回；仅按位置或 Repository 筛选时可能少于 limit，甚至为空。"
+    )
     next_cursor: str | None = Field(
         None,
-        description="还有下一页时，返回本页最后一个 Run ID；否则为空。与事件游标不能混用。",
+        description="还有未扫描的原生运行时，返回本次最后已消费原生行的 Run ID，否则为空。它可能不在筛选后的 items 中；应原样用于下一页，不能与事件游标混用。",
     )
-    has_more: bool = Field(description="查询时是否还有更多运行。")
+    has_more: bool = Field(
+        description="查询时是否还有未扫描的原生运行；不保证后续窗口中一定存在匹配筛选条件的运行。"
+    )
 
 
 class EventError(BaseModel):
@@ -296,7 +326,6 @@ OUTPUTS_EXAMPLE = {
 
 
 JOB_EXAMPLE = {
-    "job_id": EXAMPLE_JOB_ID,
     "job_name": "daily_job",
     "repository_location_name": "my_code",
     "repository_name": "my_repository",
@@ -308,7 +337,6 @@ RUN_EXAMPLE = {
     "run_id": EXAMPLE_RUN_ID,
     "job_name": "daily_job",
     "status": "SUCCESS",
-    "job_id": EXAMPLE_JOB_ID,
     "repository_location_name": "my_code",
     "repository_name": "my_repository",
     "created_at": "2026-11-08T00:00:00Z",
@@ -362,28 +390,43 @@ def create_discovery_router(get_adapter, verify_token) -> APIRouter:
         responses=responses("符合筛选条件的完整 Job 列表。", {"items": [JOB_EXAMPLE]}),
     )
     def jobs(
-        location_name: Annotated[
+        repository_location_name: Annotated[
             NonEmpty | None,
             Query(description="可选代码位置名称；精确匹配。", examples=["my_code"]),
         ] = None,
         repository_name: Annotated[
             NonEmpty | None,
             Query(
-                description="可选 Repository 名称；精确匹配。",
+                description="可选 Repository 名称；精确匹配。省略时列出全部 Repository，不使用默认 Repository。",
                 examples=["my_repository"],
             ),
+        ] = None,
+        location_name: Annotated[
+            NonEmpty | None, Query(include_in_schema=False)
         ] = None,
         adapter: DagsterAdapter = adapter_dependency,
     ):
         """获取完整 Job 发现列表。当前接口不分页。
 
-        job_id 编码了代码位置、Repository 和 Job 名称，因此不同位置的同名 Job 具有不同 ID。
-        请保留返回的 job_id 用于后续配置查询、预检和提交，不要用 job_name 替代。
+        使用 job_name 请求详情、配置预检或提交。同名 Job 可通过返回的
+        repository_location_name 和 repository_name 指定。省略筛选条件时列出所有已加载 Repository。
         """
-        return adapter.list_jobs(location_name, repository_name)
+        if (
+            repository_location_name
+            and location_name
+            and repository_location_name != location_name
+        ):
+            raise GatewayHTTPError(
+                422,
+                "REQUEST_VALIDATION_FAILED",
+                "Conflicting repository location filters",
+            )
+        return adapter.list_jobs(
+            repository_location_name or location_name, repository_name
+        )
 
     @router.get(
-        "/jobs/{job_id}",
+        "/jobs/{job_name}",
         response_model=JobDetail,
         tags=["Jobs"],
         summary="获取 Job 详情",
@@ -392,12 +435,25 @@ def create_discovery_router(get_adapter, verify_token) -> APIRouter:
             "Job 定义与所属位置。", {**JOB_EXAMPLE, "op_names": ["extract", "load"]}
         ),
     )
-    def job(job_id: JobId, adapter: DagsterAdapter = adapter_dependency):
-        """使用发现接口返回的 job_id 查询唯一 Job，包含 op 名称。ID 无效返回 422，Job 不存在返回 404。"""
-        return adapter.get_job(job_id)
+    def job(
+        job_name: JobName,
+        repository_location_name: RepositoryLocationQuery = None,
+        repository_name: RepositoryQuery = None,
+        adapter: DagsterAdapter = adapter_dependency,
+    ):
+        """按 Job 名称查询详情和 op 名称。
+
+        repository_location_name 与 repository_name 均可省略，网关按已给条件推断实际位置与 Repository。
+        未指定任何定位参数时，按全局同名 Job 唯一匹配；不存在返回 404，多项匹配返回
+        409 JOB_SELECTION_AMBIGUOUS，并列出候选位置与 Repository，调用方可补充任一条件消除歧义。
+        """
+        reference = resolve_job_reference(
+            adapter, job_name, repository_location_name, repository_name
+        )
+        return _public_job_result(adapter.get_job(reference["job_id"]), reference)
 
     @router.get(
-        "/jobs/{job_id}/config-schema",
+        "/jobs/{job_name}/config-schema",
         response_model=ConfigSchemaResponse,
         tags=["Jobs"],
         summary="获取 Job 配置类型图",
@@ -405,7 +461,9 @@ def create_discovery_router(get_adapter, verify_token) -> APIRouter:
         responses=responses(
             "Dagster 原生配置类型图。",
             {
-                "job_id": EXAMPLE_JOB_ID,
+                "job_name": EXAMPLE_JOB_NAME,
+                "repository_location_name": "my_code",
+                "repository_name": "my_repository",
                 "format": "dagster",
                 "root_type_key": "Shape.example",
                 "default_yaml": "{}\n",
@@ -422,17 +480,29 @@ def create_discovery_router(get_adapter, verify_token) -> APIRouter:
             },
         ),
     )
-    def config_schema(job_id: JobId, adapter: DagsterAdapter = adapter_dependency):
+    def config_schema(
+        job_name: JobName,
+        repository_location_name: RepositoryLocationQuery = None,
+        repository_name: RepositoryQuery = None,
+        adapter: DagsterAdapter = adapter_dependency,
+    ):
         """返回目标 Job 的 Dagster 原生配置类型图和默认 YAML，不是标准 JSON Schema。
 
         从 root_type_key 开始，通过 configTypeKey/typeParamKeys 引用查找 types 中的类型。
         对复合类型读取 fields；枚举、数组、Map 等保留 Dagster 的原生扩展字段。
         默认 YAML 是配置提示，提交前仍应调用预检接口。
+        代码位置与 Repository 均可省略；按已给条件唯一匹配真实 Job，
+        无匹配返回 404，同名歧义返回 409，并附候选位置与 Repository。
         """
-        return adapter.get_config_schema(job_id)
+        reference = resolve_job_reference(
+            adapter, job_name, repository_location_name, repository_name
+        )
+        return _public_job_result(
+            adapter.get_config_schema(reference["job_id"]), reference
+        )
 
     @router.post(
-        "/jobs/{job_id}/validate",
+        "/jobs/{job_name}/validate",
         response_model=ValidationResponse,
         tags=["Jobs"],
         summary="预检 Job 配置",
@@ -440,7 +510,9 @@ def create_discovery_router(get_adapter, verify_token) -> APIRouter:
         responses=responses(
             "配置验证已完成；valid=false 表示配置无效，不创建 Run。",
             {
-                "job_id": EXAMPLE_JOB_ID,
+                "job_name": EXAMPLE_JOB_NAME,
+                "repository_location_name": "my_code",
+                "repository_name": "my_repository",
                 "valid": False,
                 "errors": [
                     {
@@ -453,8 +525,10 @@ def create_discovery_router(get_adapter, verify_token) -> APIRouter:
         ),
     )
     def validate(
-        job_id: JobId,
+        job_name: JobName,
         payload: ValidationRequest,
+        repository_location_name: RepositoryLocationQuery = None,
+        repository_name: RepositoryQuery = None,
         adapter: DagsterAdapter = adapter_dependency,
     ):
         """校验运行配置与 op/asset 执行选择，不创建 Run、不启动执行。
@@ -463,8 +537,15 @@ def create_discovery_router(get_adapter, verify_token) -> APIRouter:
         errors.path 相对于 run_config，包含字段名、数组下标或 Map 键；缺失/未知字段会定位到字段本身。
         一条上游错误涉及多个缺失或未知字段时，按字段分别返回错误项；根级或 Selector 错误可定位到整个对象。
         验证通过只代表配置符合当前 Job 定义，后续执行仍可能因资源或运行环境失败。
+        代码位置与 Repository 均可省略，网关按已给条件推断真实 Job；
+        存在多个匹配时返回 409 JOB_SELECTION_AMBIGUOUS，调用方可补充定位参数。
         """
-        return adapter.validate_job(job_id, **payload.model_dump())
+        reference = resolve_job_reference(
+            adapter, job_name, repository_location_name, repository_name
+        )
+        return _public_job_result(
+            adapter.validate_job(reference["job_id"], **payload.model_dump()), reference
+        )
 
     @router.get(
         "/runs",
@@ -478,6 +559,7 @@ def create_discovery_router(get_adapter, verify_token) -> APIRouter:
         ),
     )
     def runs(
+        request: Request,
         statuses: Annotated[
             list[DagsterRunStatus] | None,
             Query(
@@ -488,12 +570,18 @@ def create_discovery_router(get_adapter, verify_token) -> APIRouter:
             NonEmpty | None,
             Query(description="可选 Job 名称；同名 Job 的不同代码位置会一起匹配。"),
         ] = None,
-        job_id: Annotated[
+        repository_location_name: Annotated[
             NonEmpty | None,
             Query(
-                max_length=4096,
-                description="发现接口返回的复合 Job ID；精确筛选代码位置、Repository 和 Job。与 job_name 或保留 Repository 标签冲突时返回 422。",
-                examples=[EXAMPLE_JOB_ID],
+                description="可选代码位置名称；可单独指定。省略时不限制位置，不要求 Job 当前仍已加载。",
+                examples=["my_code"],
+            ),
+        ] = None,
+        repository_name: Annotated[
+            NonEmpty | None,
+            Query(
+                description="可选 Repository 名称；可单独指定。省略时不限制 Repository，不使用网关默认值。",
+                examples=["__repository__"],
             ),
         ] = None,
         tag: Annotated[
@@ -508,17 +596,31 @@ def create_discovery_router(get_adapter, verify_token) -> APIRouter:
             Query(description="上一页返回的 next_cursor（Run ID）；不能使用事件游标。"),
         ] = None,
         limit: Annotated[
-            int, Query(ge=1, le=200, description="每页最多返回的运行数量。")
+            int,
+            Query(
+                ge=1,
+                le=200,
+                description="本次最多消费的原生运行数量。仅位置或 Repository 筛选在扫描窗口内执行，实际返回数量可能更少。",
+            ),
         ] = 50,
         adapter: DagsterAdapter = adapter_dependency,
     ):
-        """按状态、唯一 Job ID 或 Job 名称、标签分页查询运行，不返回完整运行配置。
+        """按状态、Job 名称、代码位置、Repository 和标签分页查询运行，不返回完整运行配置。
 
         使用返回的 next_cursor 获取下一页。分页反映每次查询的实时数据，不提供跨页快照。
         重复相同标签键但值不同属于无效请求，不会静默覆盖。
-        job_id 使用与 Dagster 原生 Job 运行列表相同的 Repository 标签筛选；
-        同名 Job 可按 job_id 精确区分。缺少 Repository 来源标签的旧运行不会匹配 job_id，应改用 job_name 查询。
+        仅提供 job_name 时查询所有位置和 Repository 的同名运行，不执行 Job 发现，也不要求 Job 当前仍已加载。
+        repository_location_name 与 repository_name 均可单独提供，省略的条件不加默认值，也不执行当前 Job 发现。
+        两者全给时使用 Dagster 原生 Repository 标签筛选；仅给其中之一时在当前原生扫描窗口内筛选，
+        一页可能少于 limit 甚至为空。has_more=true 时应继续使用 next_cursor，它指向最后已消费原生行，
+        不一定出现在 items 中。缺少来源信息的历史运行不会匹配来源筛选，可仅按 job_name 查询。
         """
+        if "job_id" in request.query_params:
+            raise GatewayHTTPError(
+                422,
+                "REQUEST_VALIDATION_FAILED",
+                "Use job_name with optional repository_location_name and repository_name",
+            )
         tags = {}
         for expression in tag or []:
             key, separator, value = expression.partition("=")
@@ -535,14 +637,20 @@ def create_discovery_router(get_adapter, verify_token) -> APIRouter:
                     "Repeated tag keys must use the same value",
                 )
             tags[key] = value
-        build_runs_filter(job_name=job_name, tags=tags, job_id=job_id)
+        build_runs_filter(
+            job_name=job_name,
+            tags=tags,
+            repository_location_name=repository_location_name,
+            repository_name=repository_name,
+        )
         return adapter.list_runs(
             statuses=[value.value for value in statuses] if statuses else None,
             job_name=job_name,
             tags=tags or None,
             cursor=cursor,
             limit=limit,
-            job_id=job_id,
+            repository_location_name=repository_location_name,
+            repository_name=repository_name,
         )
 
     @router.get(
