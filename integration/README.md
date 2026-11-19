@@ -1,6 +1,6 @@
 # 隔离验收
 
-这套验收会创建并终止测试 Run，仅使用脚本自己启动的 Dagster `1.13.26`。
+这套验收会创建并终止测试 Run，仅使用脚本自己启动的 Dagster `1.13.30`。
 脚本不接受业务服务 URL，清除继承的 Dagster/网关连接配置，使用临时存储与独立
 测试 Job。原生模式使用随机本机端口；Docker 模式使用独立内部网络和命名卷，
 不向宿主发布端口，HTTP 检查通过 `docker compose exec` 在代理容器内访问测试
@@ -25,11 +25,11 @@ python integration/check.py --mode docker --image dagster-webhook:acceptance
 
 ## 无 Docker 的本机验收
 
-使用隔离 Python 环境安装项目依赖和 `dagster-webserver==1.13.26`：
+使用隔离 Python 环境安装项目依赖和 `dagster-webserver==1.13.30`：
 
 ```bash
 uv venv /tmp/dagster-gateway-acceptance
-uv pip install --python /tmp/dagster-gateway-acceptance/bin/python . dagster-webserver==1.13.26
+uv pip install --python /tmp/dagster-gateway-acceptance/bin/python . dagster-webserver==1.13.30
 /tmp/dagster-gateway-acceptance/bin/python integration/check.py --mode native
 ```
 

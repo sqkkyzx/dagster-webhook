@@ -6,7 +6,7 @@
 
 ## 启动与连接
 
-要求 Python 3.13 或 3.14，当前依赖 Dagster `1.13.26`。
+要求 Python 3.13 或 3.14，当前依赖 Dagster `1.13.30`。
 
 ```bash
 git clone https://github.com/sqkkyzx/dagster-webhook.git
@@ -220,7 +220,7 @@ Header 和 Body 至少提供一处；两处均未提供返回 `422`，不会自�
 
 幂等键长度为 1–200 个字符，仅允许字母、数字、点、下划线、冒号和短横线。键在同一调用方内生效：同键、同参数返回已有 Run；同键、不同参数返回 `409 IDEMPOTENCY_PAYLOAD_MISMATCH`。每次提交前先通过 SQLite 原子占位并持久化 `submission_id`，只允许占位成功的请求发送一次创建操作；远程请求期间不持有数据库事务锁。同键正在处理时返回 `409 IDEMPOTENCY_IN_PROGRESS` 和 `Retry-After`，等待后使用同键重试。
 
-Dagster 1.13.26 的 GraphQL 提交不支持客户端指定 Run ID。新接口将 `submission_id` 写入受保护标签 `dagster-webhook/submission_id`，并在成功响应后保存 Dagster 分配的真实 Run ID。标签只用于恢复关联，防止并发重复提交依赖本地原子占位。
+Dagster 1.13.30 的 GraphQL 提交不支持客户端指定 Run ID。幂等接口将 `submission_id` 写入受保护标签 `dagster-webhook/submission_id`，并在成功响应后保存 Dagster 分配的真实 Run ID。标签只用于恢复关联，防止并发重复提交依赖本地原子占位。
 
 如果首次提交超时，或 Dagster 已响应但后续存储写入失败，接口返回 `409 SUBMISSION_OUTCOME_UNKNOWN`。进程中断或租约到期也按结果不确定处理。后续使用相同键重试时只按提交关联标签查找已有运行，核对唯一匹配、Job 来源和状态，不自动再次创建。仅找到 `NOT_STARTED`、查无运行、匹配不唯一或来源不一致，都不能确认提交；无法核实时也不会重提。
 
@@ -326,7 +326,7 @@ curl --fail-with-body \
 ```yaml
 services:
   dagster-webhook:
-    image: sqkkyzx/dagster-webhook:1.13.26.9
+    image: sqkkyzx/dagster-webhook:1.13.30.0
     volumes:
       - ./data:/data
       - ./storage/io-storage:/opt/dagster/dagster_home/storage:ro
@@ -425,6 +425,6 @@ uv pip install pytest httpx
 uv run --no-sync python -m pytest -q
 ```
 
-另有真实 Dagster `1.13.26` 的[隔离验收流程](integration/README.md)，包含并发提交、接受后响应丢失、重启恢复和批量终止。它只操作自己创建的测试实例，不接收业务服务地址。无 Docker 时可运行原生模式；原生模式通过不代表成品镜像已通过验收。
+另有真实 Dagster `1.13.30` 的[隔离验收流程](integration/README.md)，包含并发提交、接受后响应丢失、重启恢复和批量终止。它只操作自己创建的测试实例，不接收业务服务地址。无 Docker 时可运行原生模式；原生模式通过不代表成品镜像已通过验收。
 
 CI 先运行测试、构建成品镜像并在隔离 Dagster 环境中验收。只有 `master` 推送且验收通过后，才将已测过的同一个镜像发布到 GHCR 和 Docker Hub，使用 `latest` 和完整版本标签，并创建 `v<版本号>` Git 标签。PR 只测试，不发布。仓库 Secrets 需要配置 Docker Hub 凭据，钉钉通知使用可选的 `WEBHOOK_URL`。
